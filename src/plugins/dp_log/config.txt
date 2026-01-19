@@ -1,0 +1,80 @@
+startup.conf file should contain like this 
+
+Step 1 — Reserve a dedicated CPU core in startup.conf
+
+Pick 1 core that is NOT:
+
+main-core
+
+in corelist-workers
+
+Example (8 cores: 0–7):
+
+cpu {
+  main-core 0
+  corelist-workers 1-6
+}
+
+
+Core 7 is now free for the logger thread.
+
+
+
+
+
+
+Step 5 — Add config parsing: dp-log { ... }
+
+So you can do this in startup.conf:
+
+dp-log {
+  enable
+  writer-core 7
+  path /var/log/vpp/acl-deny.csv
+  ring-size 65536
+}
+
+
+Implement:
+
+VLIB_CONFIG_FUNCTION(dp_log_config, "dp-log");
+
+parse tokens: enable, writer-core, path, ring-size
+
+
+
+
+
+
+Ring Size Configuration:
+
+The default ring size is 1 << 16 = 65,536 elements per thread.
+
+How to Adjust Ring Size:
+You have two ways to change it:
+
+1. Via VPP Configuration File (e.g., startup.conf):
+dp-log {
+  ring-size 131072      # Set to 2^17 (131,072 elements)
+  enable
+  path /var/log/vpp-dp-log.csv
+  writer-core 2         # Pin writer thread to core 2
+}
+
+2. Via CLI Commands (at runtime):
+dp-log enable
+dp-log ring-size 262144   # 2^18 = 262,144 elements
+dp-log path /tmp/custom-log.csv
+dp-log writer-core 1
+
+Key Parameters:
+ring-size - Must be power-of-2 (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, ...)
+path - Output CSV file path
+writer-core - Linux CPU core to pin writer thread (-1 = no pin)
+enable/disable - Start/stop logging
+The ring uses lock-free SPSC (Single Producer/Single Consumer) design with atomic operations for thread safety.
+
+
+
+
+==>> for writer core cpu affinity is set so it is better to isolcpus under frub setting for vpp only runs these cores (/etc/vpp/startup.conf file)

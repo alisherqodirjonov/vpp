@@ -1,17 +1,8 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2016-2018 Cisco and/or its affiliates.
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at:
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
  */
+
 #include <stddef.h>
 #include <netinet/in.h>
 
@@ -31,6 +22,9 @@
 
 #include <vppinfra/bihash_40_8.h>
 #include <vppinfra/bihash_template.h>
+
+
+#include "dp_log/dp_log.h"  // dp_log integration
 
 typedef struct
 {
@@ -476,7 +470,67 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 							     &match_acl_pos,
 							     &match_acl_in_index,
 							     &match_rule_index,
-							     &trace_bitmap);
+							     &trace_bitmap);   /// this is what i need to log after this
+
+
+		/* Log ONLY deny decisions that matched an ACL rule (recommended).
+		* If you also want "default deny/no match", remove the `is_match` condition.
+		*/
+
+		/*If you want to log all denies (including “no ACL matched”)
+		Change the if to:
+
+		if (PREDICT_FALSE (dp_log_is_enabled () && action == 0))
+
+		Just note: if is_match == 0, then match_acl_in_index / match_rule_index may be ~0 (you’ll see that in the file).
+		*/
+		if (PREDICT_FALSE (dp_log_is_enabled () && is_match && action == 0)){
+		dp_log_acl_event_t ev;
+		clib_memset (&ev, 0, sizeof (ev));
+
+		ev.ts_cycles   = clib_cpu_time_now ();
+		ev.is_ip6      = (u8) is_ip6;
+
+		/* These field names depend on the real fa_5tuple type in your branch.
+		* Replace the 3 lines below with the correct accessors if your struct differs.
+		*/
+		ev.proto       = fa_5tuple[0].l4.proto;
+		ev.sport       = clib_net_to_host_u16 (fa_5tuple[0].l4.port[0]);
+		ev.dport       = clib_net_to_host_u16 (fa_5tuple[0].l4.port[1]);
+
+		ev.sw_if_index = sw_if_index[0];
+
+		/* fib_index is usually available in vnet_buffer(b0)->ip.fib_index in VPP.
+		* If your buffer doesn't have it here, set 0 or derive it elsewhere.
+		*/
+		ev.fib_index   = vnet_buffer (b[0])->ip.fib_index;
+
+		/* Matched ACL + rule */
+		ev.acl_index   = match_acl_in_index;
+		ev.rule_index  = match_rule_index;
+
+		/* IMPORTANT: in this node, deny == action 0 */
+		ev.action      = (u8) action;
+
+		if (!is_ip6)
+		{
+			/* Replace these with correct fields for your fa_5tuple if needed */
+			ev.ip.v4.src = fa_5tuple[0].ip4_addr[0];
+			ev.ip.v4.dst = fa_5tuple[0].ip4_addr[1];
+		}
+		else
+		{
+			ev.ip.v6.src = fa_5tuple[0].ip6_addr[0];
+			ev.ip.v6.dst = fa_5tuple[0].ip6_addr[1];
+		}
+
+		// dp_log_acl_enq (thread_index, &ev);
+		dp_log_acl_enq_safe (thread_index, &ev); /* safe version that works even if dp_log plugin isn't loaded */
+
+		}
+
+
+		       
 	      if (PREDICT_FALSE
 		  (is_match && am->interface_acl_counters_enabled))
 		{
@@ -969,12 +1023,3 @@ VNET_FEATURE_INIT (acl_out_ip4_fa_feature, static) = {
   .node_name = "acl-plugin-out-ip4-fa",
   .runs_before = VNET_FEATURES ("ip4-dvr-reinject", "interface-output"),
 };
-
-
-/*
- * fd.io coding-style-patch-verification: ON
- *
- * Local Variables:
- * eval: (c-set-style "gnu")
- * End:
- */
