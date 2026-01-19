@@ -24,7 +24,36 @@
 #include <vppinfra/bihash_template.h>
 
 
-#include "dp_log/dp_log.h"  // dp_log integration
+// #include "dp_log/dp_log.h"  // dp_log integration
+
+#include <vlib/unix/plugin.h>
+#include <vnet/plugin/plugin.h>
+#include <dp_log/dp_log.h>
+
+typedef int (*dp_log_enq_fn_t)(u32, const dp_log_acl_event_t *);
+static dp_log_enq_fn_t dp_log_enq_fp;
+static int dp_log_initialized = 0;
+static u64 dp_log_event_count = 0;
+static u64 dp_log_call_count = 0;
+
+static void
+acl_dp_log_resolve_once (void)
+{
+  if (PREDICT_TRUE (dp_log_initialized))
+    return;
+    
+  dp_log_initialized = 1;
+  
+  /* Use the exact plugin filename as seen in 'show plugins' */
+  dp_log_enq_fp = (dp_log_enq_fn_t)
+    vlib_get_plugin_symbol ("dp_log_plugin.so", "dp_log_acl_enq_export");
+
+  if (dp_log_enq_fp == 0)
+    clib_warning ("ACL: dp_log not available (dp_log_plugin.so not loaded or symbol missing)");
+  else
+    clib_warning ("ACL: dp_log hook active, function pointer = %p", dp_log_enq_fp);
+}
+
 
 typedef struct
 {
@@ -484,19 +513,24 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 
 		Just note: if is_match == 0, then match_acl_in_index / match_rule_index may be ~0 (you’ll see that in the file).
 		*/
-		if (PREDICT_FALSE (dp_log_is_enabled () && is_match && action == 0)){
+		acl_dp_log_resolve_once ();
+		if (PREDICT_FALSE (dp_log_enq_fp && is_match && action == 0)){
+		dp_log_call_count++;
 		dp_log_acl_event_t ev;
 		clib_memset (&ev, 0, sizeof (ev));
 
-		ev.ts_cycles   = clib_cpu_time_now ();
+		ev.ts_ns = (u64) (clib_time_now (&vm->clib_time) * 1e9);
 		ev.is_ip6      = (u8) is_ip6;
 
 		/* These field names depend on the real fa_5tuple type in your branch.
 		* Replace the 3 lines below with the correct accessors if your struct differs.
 		*/
 		ev.proto       = fa_5tuple[0].l4.proto;
-		ev.sport       = clib_net_to_host_u16 (fa_5tuple[0].l4.port[0]);
-		ev.dport       = clib_net_to_host_u16 (fa_5tuple[0].l4.port[1]);
+		// ev.sport       = clib_net_to_host_u16 (fa_5tuple[0].l4.port[0]);
+		// ev.dport       = clib_net_to_host_u16 (fa_5tuple[0].l4.port[1]);
+
+		ev.sport       = fa_5tuple[0].l4.port[0];
+		ev.dport       = fa_5tuple[0].l4.port[1];
 
 		ev.sw_if_index = sw_if_index[0];
 
@@ -525,7 +559,12 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 		}
 
 		// dp_log_acl_enq (thread_index, &ev);
-		dp_log_acl_enq_safe (thread_index, &ev); /* safe version that works even if dp_log plugin isn't loaded */
+		// dp_log_acl_enq_safe (thread_index, &ev); /* safe version that works even if dp_log plugin isn't loaded */
+		int ret = dp_log_enq_fp (thread_index, &ev);
+		if (ret)
+		  dp_log_event_count++;
+		else
+		  clib_warning ("ACL: dp_log_enq failed at call %lu (thread=%u)", dp_log_call_count, thread_index);
 
 		}
 
@@ -1022,4 +1061,24 @@ VNET_FEATURE_INIT (acl_out_ip4_fa_feature, static) = {
   .arc_name = "ip4-output",
   .node_name = "acl-plugin-out-ip4-fa",
   .runs_before = VNET_FEATURES ("ip4-dvr-reinject", "interface-output"),
+};
+/* CLI command to show dp_log counters */
+static clib_error_t *
+acl_show_dp_log_stats (vlib_main_t * vm, unformat_input_t * input,
+       vlib_cli_command_t * cmd)
+{
+  vlib_cli_output (vm, "dp_log event tracking:\n");
+  vlib_cli_output (vm, "  dp_log_initialized: %d\n", dp_log_initialized);
+  vlib_cli_output (vm, "  dp_log_enq_fp: %p\n", dp_log_enq_fp);
+  vlib_cli_output (vm, "  dp_log_call_count: %lu (deny ACL matches)\n",
+   dp_log_call_count);
+  vlib_cli_output (vm, "  dp_log_event_count: %lu (successfully enqueued)\n",
+   dp_log_event_count);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (acl_show_dp_log_stats_command, static) = {
+  .path = "show acl dp-log stats",
+  .short_help = "show ACL dp-log event statistics",
+  .function = acl_show_dp_log_stats,
 };
