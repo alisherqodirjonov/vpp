@@ -167,7 +167,7 @@ compile_commands.json
 /.ninja_log
 /.cmake
 /CMakeCache.txt
-/build.ninja
+#/build.ninja
 /cmake_install.cmake
 /startup.conf
 /startup.vpp
