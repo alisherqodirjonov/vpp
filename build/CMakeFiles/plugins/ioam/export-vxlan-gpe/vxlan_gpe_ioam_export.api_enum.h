@@ -1,8 +1,0 @@
-#ifndef included_vxlan_gpe_ioam_export_api_enum_h
-#define included_vxlan_gpe_ioam_export_api_enum_h
-typedef enum {
-   VL_API_VXLAN_GPE_IOAM_EXPORT_ENABLE_DISABLE,
-   VL_API_VXLAN_GPE_IOAM_EXPORT_ENABLE_DISABLE_REPLY,
-   VL_MSG_VXLAN_GPE_IOAM_EXPORT_LAST
-} vl_api_vxlan_gpe_ioam_export_enum_t;
-#endif
