@@ -1,0 +1,14 @@
+#ifndef included_virtio_api_enum_h
+#define included_virtio_api_enum_h
+typedef enum {
+   VL_API_VIRTIO_PCI_CREATE,
+   VL_API_VIRTIO_PCI_CREATE_REPLY,
+   VL_API_VIRTIO_PCI_CREATE_V2,
+   VL_API_VIRTIO_PCI_CREATE_V2_REPLY,
+   VL_API_VIRTIO_PCI_DELETE,
+   VL_API_VIRTIO_PCI_DELETE_REPLY,
+   VL_API_SW_INTERFACE_VIRTIO_PCI_DUMP,
+   VL_API_SW_INTERFACE_VIRTIO_PCI_DETAILS,
+   VL_MSG_VIRTIO_LAST
+} vl_api_virtio_enum_t;
+#endif

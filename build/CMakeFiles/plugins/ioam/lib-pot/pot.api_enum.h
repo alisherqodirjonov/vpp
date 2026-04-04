@@ -1,0 +1,14 @@
+#ifndef included_pot_api_enum_h
+#define included_pot_api_enum_h
+typedef enum {
+   VL_API_POT_PROFILE_ADD,
+   VL_API_POT_PROFILE_ADD_REPLY,
+   VL_API_POT_PROFILE_ACTIVATE,
+   VL_API_POT_PROFILE_ACTIVATE_REPLY,
+   VL_API_POT_PROFILE_DEL,
+   VL_API_POT_PROFILE_DEL_REPLY,
+   VL_API_POT_PROFILE_SHOW_CONFIG_DUMP,
+   VL_API_POT_PROFILE_SHOW_CONFIG_DETAILS,
+   VL_MSG_POT_LAST
+} vl_api_pot_enum_t;
+#endif

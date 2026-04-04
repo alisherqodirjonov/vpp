@@ -1,0 +1,16 @@
+#ifndef included_punt_api_enum_h
+#define included_punt_api_enum_h
+typedef enum {
+   VL_API_SET_PUNT,
+   VL_API_SET_PUNT_REPLY,
+   VL_API_PUNT_SOCKET_REGISTER,
+   VL_API_PUNT_SOCKET_REGISTER_REPLY,
+   VL_API_PUNT_SOCKET_DUMP,
+   VL_API_PUNT_SOCKET_DETAILS,
+   VL_API_PUNT_SOCKET_DEREGISTER,
+   VL_API_PUNT_SOCKET_DEREGISTER_REPLY,
+   VL_API_PUNT_REASON_DUMP,
+   VL_API_PUNT_REASON_DETAILS,
+   VL_MSG_PUNT_LAST
+} vl_api_punt_enum_t;
+#endif

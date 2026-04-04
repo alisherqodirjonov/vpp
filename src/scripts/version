@@ -20,9 +20,12 @@ cd "$path"
 if [ -f .version ]; then
     vstring=$(cat .version)
 else
-    vstring=$(git describe --long --match "v*")
+    vstring=$(git describe --long --match "v*" 2>/dev/null)
     if [ $? != 0 ]; then
-      exit 1
+      # No tags found - generate version from short commit hash
+      CMT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+      echo "0.0.0-0~g${CMT}"
+      exit 0
     fi
 fi
 
