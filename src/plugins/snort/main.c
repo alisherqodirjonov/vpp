@@ -14,6 +14,12 @@
 
 snort_main_t snort_main;
 
+__clib_export snort_main_t *
+snort_get_main ()
+{
+  return &snort_main;
+}
+
 VLIB_REGISTER_LOG_CLASS (snort_log, static) = {
   .class_name = "snort",
 };

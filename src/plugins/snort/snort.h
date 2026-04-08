@@ -16,8 +16,9 @@
 
 #define SNORT_INVALID_CLIENT_INDEX CLIB_U32_MAX
 
-STATIC_ASSERT (VNET_BUFFER_OPAQUE_SIZE >= sizeof (daq_vpp_pkt_metadata_t),
-	       "metadata must fit into vnet buffer opaque");
+STATIC_ASSERT (sizeof (((vnet_buffer_opaque2_t *) 0)->unused) >=
+		 sizeof (daq_vpp_pkt_metadata_t),
+	       "metadata must fit into vnet buffer opaque2 unused area");
 
 typedef struct
 {
@@ -350,7 +351,11 @@ snort_get_instance_by_index (u32 instance_index)
 static_always_inline daq_vpp_pkt_metadata_t *
 snort_get_buffer_metadata (vlib_buffer_t *b)
 {
-  return vnet_buffer_get_opaque (b);
+  /* Use opaque2->unused instead of opaque->unused.  The latter is in a union
+   * with ip.adj_index, ip.fib_index, ip.reass etc — writing metadata there
+   * destroys state that NAT, ACL and ip4-local depend on, causing packets
+   * to be dropped as "spoofed local-address" after snort returns them. */
+  return (daq_vpp_pkt_metadata_t *) vnet_buffer2 (b)->unused;
 }
 
 #define log_debug(fmt, ...)                                                   \

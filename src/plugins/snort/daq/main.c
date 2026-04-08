@@ -89,6 +89,15 @@ daq_vpp_destroy (void *handle)
   uint16_t instance_id = ctx->instance_id;
 
   DEBUG ("destroying instance %u", instance_id);
+
+  /* Release qpairs assigned to this instance so they can be reused */
+  for (uint16_t i = 0; i < ctx->num_qpairs; i++)
+    {
+      daq_vpp_qpair_t *qp = ctx->qpairs[i];
+      if (qp && qp->used_by_instance == ctx->instance_id)
+	qp->used_by_instance = 0;
+    }
+
   free (ctx->qpairs);
   if (ctx->epoll_fd != -1)
     close (ctx->epoll_fd);
@@ -330,9 +339,10 @@ daq_vpp_instantiate (DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstance_h modinst,
 	}
     }
 
-  /* assign qpair to ths instance */
+  /* assign qpair to this instance */
   if (n_qpair_ids)
     {
+      /* explicit qpair assignment via input name (e.g. -i name:0.0,1.0) */
       for (uint32_t i = 0; i < n_qpair_ids; i++)
 	{
 	  daq_vpp_qpair_t *qp;
@@ -340,8 +350,7 @@ daq_vpp_instantiate (DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstance_h modinst,
 	  if (!qp)
 	    {
 	      rv = daq_vpp_err (ctx, "cannot find qpair %u.%u",
-				qpair_ids[i].thread_id, qpair_ids[i].queue_id,
-				ctx->instance_id);
+				qpair_ids[i].thread_id, qpair_ids[i].queue_id);
 	      goto err;
 	    }
 	  rv = daq_vpp_add_qpair_to_instance (ctx, qp);
@@ -351,8 +360,21 @@ daq_vpp_instantiate (DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstance_h modinst,
       free (qpair_ids);
       qpair_ids = 0;
     }
+  else if (n_instances > 1)
+    {
+      /* auto-distribute qpairs round-robin across packet threads */
+      for (daq_vpp_qpair_index_t i = 0; i < in->num_qpairs; i++)
+	{
+	  if ((i % n_instances) + 1 == instance_id)
+	    {
+	      rv = daq_vpp_add_qpair_to_instance (ctx, in->qpairs + i);
+	      if (rv != DAQ_SUCCESS)
+		goto err;
+	    }
+	}
+    }
   else
-    /* add all qpairs to this instance */
+    /* single instance — add all qpairs */
     for (daq_vpp_qpair_index_t i = 0; i < in->num_qpairs; i++)
       {
 	rv = daq_vpp_add_qpair_to_instance (ctx, in->qpairs + i);

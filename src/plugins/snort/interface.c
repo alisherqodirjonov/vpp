@@ -17,6 +17,11 @@ VLIB_REGISTER_LOG_CLASS (snort_log, static) = {
 VNET_FEATURE_INIT (snort_ip4_input, static) = {
   .arc_name = "ip4-unicast",
   .node_name = "snort-ip4-input",
+  .runs_after = VNET_FEATURES ("nat44-in2out-worker-handoff",
+				"nat44-out2in-worker-handoff",
+				"nat44-ed-classify",
+				"nat-pre-in2out",
+				"nat-pre-out2in"),
   .runs_before = VNET_FEATURES ("ip4-lookup"),
 };
 

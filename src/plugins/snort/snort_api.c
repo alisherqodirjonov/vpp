@@ -43,6 +43,10 @@ vl_api_snort_instance_create_t_handler (vl_api_snort_instance_create_t *mp)
 			      &(snort_instance_create_args_t){
 				.drop_on_disconnect = drop_on_disconnect,
 				.log2_queue_sz = min_log2 (queue_sz),
+				.log2_empty_buf_queue_sz = 6, /* 64 entries */
+				.qpairs_per_thread = 1,
+				.drop_bitmap = 1 << DAQ_VPP_VERDICT_BLOCK |
+					       1 << DAQ_VPP_VERDICT_BLACKLIST,
 			      },
 			      "%s", name);
 
