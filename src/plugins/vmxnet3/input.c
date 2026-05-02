@@ -423,7 +423,8 @@ vmxnet3_device_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
 		vlib_add_trace (vm, node, b, sizeof (*tr));
 	      tr->next_index = next[0];
 	      tr->hw_if_index = vd->hw_if_index;
-	      tr->buffer = *b;
+	      clib_memcpy_fast (&tr->buffer, b,
+				sizeof (*b) - sizeof (b->pre_data));
 	      n_trace--;
 	    }
 	  n_left--;
