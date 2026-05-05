@@ -598,6 +598,8 @@ vac_create (char *name)
 
   clib_mem_init_thread_safe (0, 256 << 20);
 
+  vl_set_memory_root_path ("vpp");
+
   if (vl_client_api_map ("/vpe-api"))
     {
       DBG1 (DBG_KNL, "vac unable to map");
