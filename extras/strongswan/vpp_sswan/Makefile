@@ -106,6 +106,16 @@ $(TARGET): $(OBJECTS)
 
 install:
 	cp $(TARGET) $(SWANPLUGINS)/$(TARGET)
+	@# Do not clobber an existing conf — operator setting (route_mode etc.) wins.
+	@# Use 'make install-conf' to force-overwrite from source.
+	@if [ ! -f "$(PLUGINCONF)/kernel-vpp.conf" ]; then \
+	  cp kernel-vpp.conf $(PLUGINCONF); \
+	  echo "installed kernel-vpp.conf to $(PLUGINCONF)"; \
+	else \
+	  echo "kernel-vpp.conf already present in $(PLUGINCONF) — leaving as-is"; \
+	fi
+
+install-conf:
 	cp kernel-vpp.conf $(PLUGINCONF)
 
 clean:

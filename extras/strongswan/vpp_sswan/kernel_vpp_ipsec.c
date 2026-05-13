@@ -34,6 +34,8 @@
 
 #include <vnet/ip-neighbor/ip_neighbor.api_enum.h>
 #include <vnet/ip-neighbor/ip_neighbor.api_types.h>
+#include <vnet/ip/ip.api_enum.h>
+#include <vnet/ip/ip.api_types.h>
 #include <vnet/ipsec/ipsec.api_enum.h>
 #include <vnet/ipsec/ipsec.api_types.h>
 #include <vnet/interface.api_enum.h>
@@ -135,6 +137,33 @@ struct private_kernel_vpp_ipsec_t
   bool use_tunnel_mode_sa;
 
   /**
+   * Route-based IPsec mode. When TRUE, policies are installed by binding
+   * SAs to a shared p2mp ipsec-itf and adding FIB routes via that interface;
+   * no SPD entries are created. Default FALSE (legacy SPD behavior).
+   */
+  bool route_mode;
+
+  /**
+   * Hash table of ipsec-itf interfaces, keyed by local-endpoint string
+   * (host address) -> ipsec_itf_t. One entry per distinct local endpoint
+   * used by any CHILD_SA. Only populated in route_mode.
+   */
+  hashtable_t *ipsec_itfs;
+
+  /**
+   * Hash table of tunnel-protect bindings, keyed by (sw_if_index, peer)
+   * -> tunnel_protect_t. One entry per active CHILD_SA in route_mode.
+   */
+  hashtable_t *tunnel_protects;
+
+  /**
+   * VPP interface name whose IPv4 the ipsec-itf borrows via unnumbered.
+   * Read from charon.plugins.kernel-vpp.wan_interface. NULL = don't
+   * unnumber (data path will drop with ip4-not-enabled on ipsec-itf).
+   */
+  char *wan_interface;
+
+  /**
    * Connections to VPP Stats
    */
   stat_client_main_t *sm;
@@ -182,6 +211,48 @@ typedef struct
   /** References for route */
   refcount_t refs;
 } route_entry_t;
+
+/**
+ * Shared p2mp ipsec-itf interface, one per local endpoint (route mode).
+ * All CHILD_SAs whose local tunnel address matches share the same
+ * ipsec-itf, with peer-protections discriminated by next-hop.
+ */
+typedef struct
+{
+  /** VPP sw_if_index of the ipsec-itf */
+  uint32_t sw_if_index;
+  /** Local endpoint string used as hash key (owned) */
+  char *local_key;
+  /** Refcount: number of tunnel-protects bound to this itf */
+  refcount_t refs;
+} ipsec_itf_t;
+
+/**
+ * A tunnel-protect binding installed on an ipsec-itf for one peer.
+ * Tracks the SA pair and the routes installed via this binding so
+ * teardown is clean.
+ */
+typedef struct
+{
+  /** sw_if_index of the ipsec-itf hosting this binding */
+  uint32_t sw_if_index;
+  /** Peer endpoint (also used as nh in tunnel-protect and routes) */
+  host_t *peer;
+  /** Outbound SA id (VPP sad_id) */
+  uint32_t sa_out;
+  /** Inbound SA id (VPP sad_id) */
+  uint32_t sa_in;
+} tunnel_protect_t;
+
+/**
+ * Composite key for tunnel_protect hashtable: (sw_if_index, peer-host).
+ * Stored alongside the value so the table can free it on remove.
+ */
+typedef struct
+{
+  uint32_t sw_if_index;
+  host_t *peer;
+} tp_key_t;
 
 #define htonll(x)                                                             \
   ((1 == htonl (1)) ?                                                         \
@@ -252,7 +323,7 @@ set_arp (char *ipStr, char *if_name, bool add)
   mp = vl_msg_api_alloc (sizeof (*mp));
   memset (mp, 0, sizeof (*mp));
   sw_if_index = get_sw_if_index (if_name);
-  if (sw_if_index == ~0)
+  if (sw_if_index == (uint32_t) ~0)
     {
       DBG1 (DBG_KNL, "sw_if_index for %s not found", if_name);
       goto error;
@@ -412,6 +483,734 @@ error:
   free (out);
   vl_msg_api_free (mp);
   return rc;
+}
+
+/* ===================================================================
+ * Route-mode helpers (ipsec-itf + tunnel-protect + per-tunnel FIB routes)
+ * ===================================================================
+ *
+ * In route_mode, every CHILD_SA causes the plugin to:
+ *   1. Ensure a shared p2mp ipsec-itf exists for the local endpoint.
+ *   2. Bind the SA pair to that interface via ipsec_tunnel_protect_update,
+ *      keyed by peer next-hop.
+ *   3. Install a FIB route for each negotiated remote traffic selector,
+ *      with the ipsec-itf as the egress interface and peer as next-hop.
+ *
+ * This bypasses VPP's SPD entirely. The benefit is that decrypted inner
+ * packets emerge on the ipsec-itf (not on the WAN's sw_if_index), so
+ * NAT44 on the WAN does not double-process them and `nat44 forwarding'
+ * can stay disabled.
+ */
+
+/**
+ * Hash a string key (used by ipsec_itfs table).
+ */
+static u_int
+itf_hash (char *key)
+{
+  return chunk_hash (chunk_from_str (key));
+}
+
+static bool
+itf_equals (char *a, char *b)
+{
+  return streq (a, b);
+}
+
+/**
+ * Hash a tp_key_t (sw_if_index + peer host).
+ */
+static u_int
+tp_hash (tp_key_t *k)
+{
+  return chunk_hash_inc (chunk_from_thing (k->sw_if_index),
+			 chunk_hash (k->peer->get_address (k->peer)));
+}
+
+static bool
+tp_equals (tp_key_t *a, tp_key_t *b)
+{
+  return a->sw_if_index == b->sw_if_index &&
+	 a->peer->ip_equals (a->peer, b->peer);
+}
+
+/**
+ * Build a stable string key for an ipsec-itf entry from a host_t.
+ * Caller frees.
+ *
+ * We deliberately do NOT use strongSwan's "%H" printf hook here because
+ * it is only registered against strongSwan's logging printf wrappers,
+ * not against libc snprintf. Use inet_ntop for a plain dotted/colon form.
+ */
+static char *
+itf_key_from_host (host_t *h)
+{
+  char buf[INET6_ADDRSTRLEN];
+  chunk_t addr = h->get_address (h);
+  int af = (h->get_family (h) == AF_INET6) ? AF_INET6 : AF_INET;
+  if (!inet_ntop (af, addr.ptr, buf, sizeof (buf)))
+    {
+      /* Fallback: hex-encode the raw address bytes so the key is still
+       * deterministic even if inet_ntop fails. */
+      static const char hex[] = "0123456789abcdef";
+      size_t n = (addr.len > 16) ? 16 : addr.len;
+      for (size_t i = 0; i < n; i++)
+	{
+	  buf[2 * i] = hex[(addr.ptr[i] >> 4) & 0xf];
+	  buf[2 * i + 1] = hex[addr.ptr[i] & 0xf];
+	}
+      buf[2 * n] = '\0';
+    }
+  return strdup (buf);
+}
+
+/**
+ * Make `target_sw_if_index` borrow the IPv4 of `donor_sw_if_index` via
+ * VPP's `sw_interface_set_unnumbered` API. Enables ip4-unicast on the
+ * borrower so decrypted inner packets emerging on an ipsec-itf can be
+ * routed by the FIB.
+ */
+static status_t
+set_interface_unnumbered (uint32_t target_sw_if_index,
+			  uint32_t donor_sw_if_index)
+{
+  vl_api_sw_interface_set_unnumbered_t *mp = NULL;
+  vl_api_sw_interface_set_unnumbered_reply_t *rmp = NULL;
+  char *out = NULL;
+  int out_len = 0;
+  status_t rv = FAILED;
+  u16 msg_id;
+
+  mp = vl_msg_api_alloc (sizeof (*mp));
+  memset (mp, 0, sizeof (*mp));
+  msg_id =
+    vl_msg_api_get_msg_index ((u8 *) "sw_interface_set_unnumbered_154a6439");
+  mp->_vl_msg_id = htons (msg_id);
+  /* CLI maps "<target> use <donor>" to:
+   *   unnumbered_sw_if_index = target  (the borrower / ipsec-itf)
+   *   sw_if_index            = donor   (the IP-bearing iface / WAN) */
+  mp->unnumbered_sw_if_index = htonl (target_sw_if_index);
+  mp->sw_if_index = htonl (donor_sw_if_index);
+  mp->is_add = 1;
+
+  if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac sw_interface_set_unnumbered failed");
+      goto error;
+    }
+  rmp = (void *) out;
+  if (rmp->retval)
+    {
+      DBG1 (DBG_KNL, "sw_interface_set_unnumbered failed rv:%d",
+	    ntohl (rmp->retval));
+      goto error;
+    }
+  DBG2 (DBG_KNL, "sw_if_index %d unnumbered to %d", target_sw_if_index,
+	donor_sw_if_index);
+  rv = SUCCESS;
+
+error:
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+  return rv;
+}
+
+/**
+ * Bring an interface admin-up via VPP API.
+ * Necessary after ipsec_itf_create — newly created ipsec-itfs come up
+ * admin-DOWN, and ipsec4-tun-input drops "ipsec packets received on
+ * disabled" until this is called.
+ */
+static status_t
+bring_up_sw_interface (uint32_t sw_if_index)
+{
+  vl_api_sw_interface_set_flags_t *mp = NULL;
+  vl_api_sw_interface_set_flags_reply_t *rmp = NULL;
+  char *out = NULL;
+  int out_len = 0;
+  status_t rv = FAILED;
+  u16 msg_id;
+
+  mp = vl_msg_api_alloc (sizeof (*mp));
+  memset (mp, 0, sizeof (*mp));
+  msg_id =
+    vl_msg_api_get_msg_index ((u8 *) "sw_interface_set_flags_f5aec1b8");
+  mp->_vl_msg_id = htons (msg_id);
+  mp->sw_if_index = htonl (sw_if_index);
+  mp->flags = htonl (IF_STATUS_API_FLAG_ADMIN_UP);
+
+  if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac sw_interface_set_flags failed");
+      goto error;
+    }
+  rmp = (void *) out;
+  if (rmp->retval)
+    {
+      DBG1 (DBG_KNL, "sw_interface_set_flags failed rv:%d",
+	    ntohl (rmp->retval));
+      goto error;
+    }
+  DBG2 (DBG_KNL, "sw_if_index %d brought admin-up", sw_if_index);
+  rv = SUCCESS;
+
+error:
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+  return rv;
+}
+
+/**
+ * Create or look up the shared ipsec-itf for a local endpoint.
+ *
+ * Returns the sw_if_index of the interface, or ~0 on failure.
+ * Refcounts the entry: every successful call must be balanced by
+ * a release_ipsec_itf() call when the corresponding tunnel-protect
+ * is torn down.
+ */
+static uint32_t
+ensure_ipsec_itf (private_kernel_vpp_ipsec_t *this, host_t *local)
+{
+  char *key = NULL;
+  ipsec_itf_t *itf = NULL;
+  uint32_t sw_if_index = ~0;
+  char *out = NULL;
+  int out_len = 0;
+  vl_api_ipsec_itf_create_t *mp = NULL;
+  vl_api_ipsec_itf_create_reply_t *rmp = NULL;
+  u16 msg_id;
+
+  key = itf_key_from_host (local);
+  this->mutex->lock (this->mutex);
+  itf = this->ipsec_itfs->get (this->ipsec_itfs, key);
+  if (itf)
+    {
+      ref_get (&itf->refs);
+      sw_if_index = itf->sw_if_index;
+      this->mutex->unlock (this->mutex);
+      free (key);
+      DBG2 (DBG_KNL, "ipsec-itf for %H exists sw_if_index %d", local,
+	    sw_if_index);
+      return sw_if_index;
+    }
+  this->mutex->unlock (this->mutex);
+
+  /* Not present: create a new p2mp ipsec-itf in VPP. */
+  mp = vl_msg_api_alloc (sizeof (*mp));
+  memset (mp, 0, sizeof (*mp));
+  msg_id = vl_msg_api_get_msg_index ((u8 *) "ipsec_itf_create_6f50b3bc");
+  mp->_vl_msg_id = htons (msg_id);
+  mp->itf.user_instance = htonl (~0); /* let VPP pick */
+  /* mode is a u8 (vl_api_tunnel_mode_t) — DO NOT byte-swap a u8.
+   * Writing htonl(1) here was a bug: on little-endian it stores 0x00 in
+   * the low byte (P2P), silently downgrading the multi-peer interface to
+   * point-to-point. With P2P the FIRST tunnel-protect succeeds and the
+   * SECOND peer's bind fails — fatal for any multi-client RA gateway. */
+  mp->itf.mode = 1; /* TUNNEL_API_MODE_MP (p2mp) */
+
+  if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac ipsec_itf_create failed");
+      goto error;
+    }
+  rmp = (void *) out;
+  if (rmp->retval)
+    {
+      DBG1 (DBG_KNL, "ipsec_itf_create failed rv:%d", ntohl (rmp->retval));
+      goto error;
+    }
+  sw_if_index = ntohl (rmp->sw_if_index);
+
+  /* Newly created ipsec-itf is admin-DOWN. Bring it up immediately,
+   * otherwise ipsec4-tun-input drops decrypted/encrypt-bound packets
+   * with "ipsec packets received on disabled". */
+  if (bring_up_sw_interface (sw_if_index) != SUCCESS)
+    {
+      DBG1 (DBG_KNL,
+	    "ipsec-itf %d created but admin-up failed; data path will drop",
+	    sw_if_index);
+      /* continue anyway — the interface exists; operator can bring it
+       * up manually with 'set interface state ipsec0 up' as a fallback */
+    }
+
+  /* Make the ipsec-itf unnumbered to the WAN so it has an IPv4 context.
+   * Without this, decrypted inner packets emerging on ipsec0 hit
+   * "ip4-not-enabled" and drop. wan_interface must be set in
+   * /etc/strongswan.d/charon/kernel-vpp.conf for this to fire. */
+  if (this->wan_interface)
+    {
+      uint32_t donor = get_sw_if_index (this->wan_interface);
+      if (donor != ~0u)
+	{
+	  if (set_interface_unnumbered (sw_if_index, donor) != SUCCESS)
+	    DBG1 (DBG_KNL,
+		  "ipsec-itf %d created but unnumber-to-%s failed; "
+		  "data path may drop at ip4-not-enabled",
+		  sw_if_index, this->wan_interface);
+	}
+      else
+	{
+	  DBG1 (DBG_KNL,
+		"wan_interface '%s' not found in VPP; ipsec-itf %d will not "
+		"be unnumbered (decrypted packets may drop)",
+		this->wan_interface, sw_if_index);
+	}
+    }
+  else
+    {
+      DBG1 (DBG_KNL,
+	    "wan_interface not configured; ipsec-itf %d has no IP context. "
+	    "Set charon.plugins.kernel-vpp.wan_interface = <vpp-iface-name>",
+	    sw_if_index);
+    }
+
+  INIT (itf, .sw_if_index = sw_if_index, .local_key = key, .refs = 1, );
+  this->mutex->lock (this->mutex);
+  this->ipsec_itfs->put (this->ipsec_itfs, itf->local_key, itf);
+  this->mutex->unlock (this->mutex);
+  DBG1 (DBG_KNL, "created ipsec-itf for %H sw_if_index %d (admin-up)",
+	local, sw_if_index);
+  /* leave 'key' owned by itf->local_key */
+  free (out);
+  vl_msg_api_free (mp);
+  return sw_if_index;
+
+error:
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+  if (key)
+    free (key);
+  return ~0;
+}
+
+/**
+ * Decrement refcount on an ipsec-itf. When the last reference is gone,
+ * delete the VPP interface and drop the table entry.
+ */
+static void
+release_ipsec_itf (private_kernel_vpp_ipsec_t *this, host_t *local)
+{
+  char *key = NULL;
+  ipsec_itf_t *itf = NULL;
+  char *out = NULL;
+  int out_len = 0;
+  vl_api_ipsec_itf_delete_t *mp = NULL;
+  vl_api_ipsec_itf_delete_reply_t *rmp = NULL;
+  u16 msg_id;
+  uint32_t sw_if_index;
+
+  key = itf_key_from_host (local);
+  this->mutex->lock (this->mutex);
+  itf = this->ipsec_itfs->get (this->ipsec_itfs, key);
+  if (!itf)
+    {
+      this->mutex->unlock (this->mutex);
+      free (key);
+      return;
+    }
+  if (!ref_put (&itf->refs))
+    {
+      this->mutex->unlock (this->mutex);
+      free (key);
+      return;
+    }
+  /* last reference: remove from table and tear down */
+  this->ipsec_itfs->remove (this->ipsec_itfs, key);
+  sw_if_index = itf->sw_if_index;
+  free (itf->local_key);
+  free (itf);
+  this->mutex->unlock (this->mutex);
+  free (key);
+
+  mp = vl_msg_api_alloc (sizeof (*mp));
+  memset (mp, 0, sizeof (*mp));
+  msg_id = vl_msg_api_get_msg_index ((u8 *) "ipsec_itf_delete_f9e6675e");
+  mp->_vl_msg_id = htons (msg_id);
+  mp->sw_if_index = htonl (sw_if_index);
+  if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac ipsec_itf_delete failed");
+      goto cleanup;
+    }
+  rmp = (void *) out;
+  if (rmp->retval)
+    DBG1 (DBG_KNL, "ipsec_itf_delete failed rv:%d", ntohl (rmp->retval));
+  else
+    DBG1 (DBG_KNL, "deleted ipsec-itf sw_if_index %d", sw_if_index);
+
+cleanup:
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+}
+
+/**
+ * Issue an ipsec_tunnel_protect_update for (sw_if_index, peer) with the
+ * given SA pair. The message carries a VLA of inbound SA ids; for now we
+ * pass exactly one (rekey overlap handling is a follow-up).
+ */
+static status_t
+tunnel_protect_update (uint32_t sw_if_index, host_t *peer, uint32_t sa_in,
+		       uint32_t sa_out)
+{
+  vl_api_ipsec_tunnel_protect_update_t *mp = NULL;
+  vl_api_ipsec_tunnel_protect_update_reply_t *rmp = NULL;
+  char *out = NULL;
+  int out_len = 0;
+  status_t rv = FAILED;
+  u16 msg_id;
+  size_t msg_size;
+  chunk_t addr;
+
+  /* sa_in[] is a VLA at the end of the message; size for n_sa_in = 1 */
+  msg_size = sizeof (*mp) + sizeof (uint32_t);
+  mp = vl_msg_api_alloc (msg_size);
+  memset (mp, 0, msg_size);
+  msg_id =
+    vl_msg_api_get_msg_index ((u8 *) "ipsec_tunnel_protect_update_30d5f133");
+  mp->_vl_msg_id = htons (msg_id);
+  mp->tunnel.sw_if_index = htonl (sw_if_index);
+  mp->tunnel.sa_out = htonl (sa_out);
+  mp->tunnel.n_sa_in = 1;
+  mp->tunnel.sa_in[0] = htonl (sa_in);
+
+  addr = peer->get_address (peer);
+  /* af is a u8 enum (vl_api_address_family_t) — direct assign, no htonl. */
+  if (peer->get_family (peer) == AF_INET6)
+    {
+      mp->tunnel.nh.af = ADDRESS_IP6;
+      memcpy (mp->tunnel.nh.un.ip6, addr.ptr, 16);
+    }
+  else
+    {
+      mp->tunnel.nh.af = ADDRESS_IP4;
+      memcpy (mp->tunnel.nh.un.ip4, addr.ptr, 4);
+    }
+
+  if (vac->send (vac, (char *) mp, msg_size, &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac ipsec_tunnel_protect_update failed");
+      goto error;
+    }
+  rmp = (void *) out;
+  if (rmp->retval)
+    {
+      DBG1 (DBG_KNL, "ipsec_tunnel_protect_update failed rv:%d",
+	    ntohl (rmp->retval));
+      goto error;
+    }
+  DBG2 (DBG_KNL, "tunnel-protect bound on sw_if_index %d nh %H sa_in %d "
+		 "sa_out %d",
+	sw_if_index, peer, sa_in, sa_out);
+  rv = SUCCESS;
+
+error:
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+  return rv;
+}
+
+/**
+ * Remove tunnel-protect for (sw_if_index, peer).
+ */
+static status_t
+tunnel_protect_remove (uint32_t sw_if_index, host_t *peer)
+{
+  vl_api_ipsec_tunnel_protect_del_t *mp = NULL;
+  vl_api_ipsec_tunnel_protect_del_reply_t *rmp = NULL;
+  char *out = NULL;
+  int out_len = 0;
+  status_t rv = FAILED;
+  u16 msg_id;
+  chunk_t addr;
+
+  mp = vl_msg_api_alloc (sizeof (*mp));
+  memset (mp, 0, sizeof (*mp));
+  msg_id =
+    vl_msg_api_get_msg_index ((u8 *) "ipsec_tunnel_protect_del_cd239930");
+  mp->_vl_msg_id = htons (msg_id);
+  mp->sw_if_index = htonl (sw_if_index);
+  addr = peer->get_address (peer);
+  /* af is u8 — no byte swap. */
+  if (peer->get_family (peer) == AF_INET6)
+    {
+      mp->nh.af = ADDRESS_IP6;
+      memcpy (mp->nh.un.ip6, addr.ptr, 16);
+    }
+  else
+    {
+      mp->nh.af = ADDRESS_IP4;
+      memcpy (mp->nh.un.ip4, addr.ptr, 4);
+    }
+  if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac ipsec_tunnel_protect_del failed");
+      goto error;
+    }
+  rmp = (void *) out;
+  if (rmp->retval)
+    {
+      DBG1 (DBG_KNL, "ipsec_tunnel_protect_del failed rv:%d",
+	    ntohl (rmp->retval));
+      goto error;
+    }
+  rv = SUCCESS;
+
+error:
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+  return rv;
+}
+
+/**
+ * Add or delete a FIB route for the given prefix, sending it out of the
+ * specified ipsec-itf with the given peer address as next-hop. This is
+ * the route-mode counterpart of the SPD path's manage_route().
+ */
+static status_t
+route_via_ipsec_itf (bool add, host_t *dst_net, uint8_t prefixlen,
+		     uint32_t sw_if_index, host_t *peer)
+{
+  vl_api_ip_route_add_del_t *mp = NULL;
+  vl_api_ip_route_add_del_reply_t *rmp = NULL;
+  vl_api_fib_path_t *apath = NULL;
+  char *out = NULL;
+  int out_len = 0;
+  status_t rv = FAILED;
+  u16 msg_id;
+  chunk_t dst_chunk, peer_chunk;
+  size_t msg_size;
+  bool is_v6 = (dst_net->get_family (dst_net) == AF_INET6);
+
+  msg_size = sizeof (*mp) + sizeof (*apath);
+  mp = vl_msg_api_alloc (msg_size);
+  memset (mp, 0, msg_size);
+  msg_id = vl_msg_api_get_msg_index ((u8 *) "ip_route_add_del_b8ecfe0d");
+  mp->_vl_msg_id = htons (msg_id);
+  mp->is_add = add;
+  mp->is_multipath = 0;
+  mp->route.prefix.len = prefixlen;
+  mp->route.n_paths = 1;
+  apath = &mp->route.paths[0];
+  apath->sw_if_index = htonl (sw_if_index);
+  apath->rpf_id = ~0;
+  apath->weight = 1;
+
+  dst_chunk = dst_net->get_address (dst_net);
+  peer_chunk = peer->get_address (peer);
+  /* af is u8 (no swap); proto is int-sized typedef enum (swap with htonl). */
+  if (is_v6)
+    {
+      mp->route.prefix.address.af = ADDRESS_IP6;
+      memcpy (mp->route.prefix.address.un.ip6, dst_chunk.ptr, 16);
+      apath->proto = htonl (FIB_API_PATH_NH_PROTO_IP6);
+      memcpy (apath->nh.address.ip6, peer_chunk.ptr, 16);
+    }
+  else
+    {
+      mp->route.prefix.address.af = ADDRESS_IP4;
+      memcpy (mp->route.prefix.address.un.ip4, dst_chunk.ptr, 4);
+      apath->proto = htonl (FIB_API_PATH_NH_PROTO_IP4);
+      memcpy (apath->nh.address.ip4, peer_chunk.ptr, 4);
+    }
+
+  if (vac->send (vac, (char *) mp, msg_size, &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac ip_route_add_del failed");
+      goto error;
+    }
+  rmp = (void *) out;
+  if (rmp->retval)
+    {
+      DBG1 (DBG_KNL, "ip_route_add_del failed rv:%d", ntohl (rmp->retval));
+      goto error;
+    }
+  DBG2 (DBG_KNL, "route %s %H/%d via %H ipsec-itf:%d",
+	add ? "installed" : "removed", dst_net, prefixlen, peer, sw_if_index);
+  rv = SUCCESS;
+
+error:
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+  return rv;
+}
+
+/**
+ * Look up the SA pair (in, out) for a CHILD_SA defined by the
+ * (src, dst) tunnel endpoints. Returns SUCCESS if both SAs are found
+ * in the plugin's SA table, FAILED otherwise.
+ *
+ * In route-mode this is called from manage_policy_route() to translate
+ * "the policy charon is asking me to install" into "the SAD IDs I should
+ * bind to the ipsec-itf".
+ */
+static status_t
+lookup_sa_pair (private_kernel_vpp_ipsec_t *this, host_t *src, host_t *dst,
+		uint8_t proto, uint32_t *sa_in, uint32_t *sa_out)
+{
+  enumerator_t *e;
+  kernel_ipsec_sa_id_t *id;
+  sa_t *sa;
+  bool found_in = FALSE, found_out = FALSE;
+
+  this->mutex->lock (this->mutex);
+  e = this->sas->create_enumerator (this->sas);
+  while (e->enumerate (e, &id, &sa))
+    {
+      if (id->proto != proto)
+	continue;
+      /* outbound SA: charon's src->dst matches our local->peer */
+      if (!found_out && id->src->ip_equals (id->src, src) &&
+	  id->dst->ip_equals (id->dst, dst))
+	{
+	  *sa_out = sa->sa_id;
+	  found_out = TRUE;
+	}
+      /* inbound SA: peer->local */
+      else if (!found_in && id->src->ip_equals (id->src, dst) &&
+	       id->dst->ip_equals (id->dst, src))
+	{
+	  *sa_in = sa->sa_id;
+	  found_in = TRUE;
+	}
+      if (found_in && found_out)
+	break;
+    }
+  e->destroy (e);
+  this->mutex->unlock (this->mutex);
+  return (found_in && found_out) ? SUCCESS : FAILED;
+}
+
+/**
+ * Route-mode counterpart of manage_policy(). Installs or removes a
+ * tunnel-protect binding plus a FIB route for the given policy.
+ *
+ * Only outbound policies trigger work; inbound policies are no-ops in
+ * route-mode (the route is symmetric and the inbound SA list on the
+ * tunnel-protect entry handles return traffic).
+ */
+static status_t
+manage_policy_route (private_kernel_vpp_ipsec_t *this, bool add,
+		     kernel_ipsec_policy_id_t *id,
+		     kernel_ipsec_manage_policy_t *data)
+{
+  uint32_t sw_if_index = ~0;
+  uint32_t sa_in = ~0, sa_out = ~0;
+  host_t *local = NULL, *peer = NULL;
+  host_t *dst_net = NULL;
+  uint8_t prefixlen;
+  tp_key_t key, *stored_key = NULL;
+  tunnel_protect_t *tp = NULL;
+  status_t rv = FAILED;
+  uint8_t sa_proto;
+
+  if (id->dir == POLICY_FWD)
+    return SUCCESS;
+  if (id->dir == POLICY_IN)
+    {
+      /* In route mode, only the outbound policy drives state. The matching
+       * inbound policy is implicit in the tunnel-protect entry. */
+      return SUCCESS;
+    }
+  if (data->type != POLICY_IPSEC || !data->sa ||
+      data->sa->mode == MODE_TRANSPORT)
+    return SUCCESS;
+
+  /* In route mode, charon's "src" is our local tunnel endpoint and "dst"
+   * is the peer. */
+  local = data->src;
+  peer = data->dst;
+  if (!local || !peer || local->is_anyaddr (local) || peer->is_anyaddr (peer))
+    {
+      DBG1 (DBG_KNL, "route_mode: anyaddr endpoint, skipping");
+      return SUCCESS;
+    }
+  sa_proto = data->sa->esp.use ? IPPROTO_ESP : IPPROTO_AH;
+
+  if (add)
+    {
+      sw_if_index = ensure_ipsec_itf (this, local);
+      if (sw_if_index == (uint32_t) ~0)
+	{
+	  DBG1 (DBG_KNL, "route_mode: ensure_ipsec_itf failed");
+	  return FAILED;
+	}
+      if (lookup_sa_pair (this, local, peer, sa_proto, &sa_in, &sa_out) !=
+	  SUCCESS)
+	{
+	  DBG1 (DBG_KNL,
+		"route_mode: SA pair for %H<->%H proto %d not in table yet; "
+		"deferring (charon should add SAs before policy)",
+		local, peer, sa_proto);
+	  release_ipsec_itf (this, local);
+	  return FAILED;
+	}
+      if (tunnel_protect_update (sw_if_index, peer, sa_in, sa_out) != SUCCESS)
+	{
+	  release_ipsec_itf (this, local);
+	  return FAILED;
+	}
+
+      INIT (tp, .sw_if_index = sw_if_index, .peer = peer->clone (peer),
+	    .sa_in = sa_in, .sa_out = sa_out, );
+      INIT (stored_key, .sw_if_index = sw_if_index,
+	    .peer = peer->clone (peer), );
+
+      this->mutex->lock (this->mutex);
+      this->tunnel_protects->put (this->tunnel_protects, stored_key, tp);
+      this->mutex->unlock (this->mutex);
+
+      id->dst_ts->to_subnet (id->dst_ts, &dst_net, &prefixlen);
+      if (dst_net && !dst_net->is_anyaddr (dst_net))
+	{
+	  if (route_via_ipsec_itf (TRUE, dst_net, prefixlen, sw_if_index,
+				   peer) != SUCCESS)
+	    DBG1 (DBG_KNL, "route_mode: route install failed (continuing)");
+	}
+      rv = SUCCESS;
+    }
+  else
+    {
+      /* Delete: route -> tunnel-protect -> release itf ref. */
+      id->dst_ts->to_subnet (id->dst_ts, &dst_net, &prefixlen);
+      sw_if_index = ensure_ipsec_itf (this, local);
+      if (sw_if_index != (uint32_t) ~0 && dst_net && !dst_net->is_anyaddr (dst_net))
+	route_via_ipsec_itf (FALSE, dst_net, prefixlen, sw_if_index, peer);
+      /* ensure_ipsec_itf bumped refs by 1; balance it. */
+      if (sw_if_index != (uint32_t) ~0)
+	release_ipsec_itf (this, local);
+
+      key.sw_if_index = sw_if_index;
+      key.peer = peer;
+      this->mutex->lock (this->mutex);
+      tp = this->tunnel_protects->remove (this->tunnel_protects, &key);
+      this->mutex->unlock (this->mutex);
+      if (tp)
+	{
+	  tunnel_protect_remove (tp->sw_if_index, tp->peer);
+	  release_ipsec_itf (this, local);
+	  tp->peer->destroy (tp->peer);
+	  free (tp);
+	}
+      rv = SUCCESS;
+    }
+
+  if (dst_net)
+    dst_net->destroy (dst_net);
+  return rv;
 }
 
 /**
@@ -1012,6 +1811,9 @@ manage_policy (private_kernel_vpp_ipsec_t *this, bool add,
 	       kernel_ipsec_policy_id_t *id,
 	       kernel_ipsec_manage_policy_t *data)
 {
+  if (this->route_mode)
+    return manage_policy_route (this, add, id, data);
+
   spd_t *spd = NULL;
   char *out = NULL, *interface = NULL;
   int out_len;
@@ -1071,7 +1873,7 @@ manage_policy (private_kernel_vpp_ipsec_t *this, bool add,
       sw_if_index = get_sw_if_index (interface);
       DBG1 (DBG_KNL, "firstly created, spd for %s found sw_if_index is %d",
 	    interface, sw_if_index);
-      if (sw_if_index == ~0)
+      if (sw_if_index == (uint32_t) ~0)
 	{
 	  DBG1 (DBG_KNL, "sw_if_index for %s not found", interface);
 	  goto error;
@@ -1937,6 +2739,15 @@ METHOD (kernel_ipsec_t, destroy, void, private_kernel_vpp_ipsec_t *this)
   this->sas->destroy (this->sas);
   this->spds->destroy (this->spds);
   this->routes->destroy (this->routes);
+  if (this->ipsec_itfs)
+    this->ipsec_itfs->destroy (this->ipsec_itfs);
+  if (this->tunnel_protects)
+    this->tunnel_protects->destroy (this->tunnel_protects);
+  if (this->wan_interface)
+    {
+      free (this->wan_interface);
+      this->wan_interface = NULL;
+    }
   if (this->sm)
     {
       stat_segment_disconnect_r (this->sm);
@@ -1984,8 +2795,29 @@ kernel_vpp_ipsec_create ()
         .use_tunnel_mode_sa = lib->settings->get_bool(lib->settings,
                             "%s.plugins.kernel-vpp.use_tunnel_mode_sa",
                             TRUE, lib->ns),
+        .route_mode = lib->settings->get_bool(lib->settings,
+                            "%s.plugins.kernel-vpp.route_mode",
+                            FALSE, lib->ns),
+        .ipsec_itfs = hashtable_create((hashtable_hash_t)itf_hash,
+                                       (hashtable_equals_t)itf_equals, 4),
+        .tunnel_protects = hashtable_create((hashtable_hash_t)tp_hash,
+                                            (hashtable_equals_t)tp_equals, 16),
+        .wan_interface = NULL,
         .sm = NULL,
     );
+
+  {
+    char *wan = lib->settings->get_str(lib->settings,
+                  "%s.plugins.kernel-vpp.wan_interface", NULL, lib->ns);
+    if (wan && *wan)
+      this->wan_interface = strdup (wan);
+  }
+
+  if (this->route_mode)
+    DBG1 (DBG_KNL, "kernel-vpp: route_mode ENABLED "
+                   "(SPD bypassed, using ipsec-itf + tunnel-protect)%s%s",
+                   this->wan_interface ? ", unnumber-to=" : "",
+                   this->wan_interface ? this->wan_interface : "");
 
   if (!init_spi (this))
     {
