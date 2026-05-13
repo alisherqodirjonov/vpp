@@ -2410,10 +2410,26 @@ METHOD (kernel_ipsec_t, add_sa, status_t, private_kernel_vpp_ipsec_t *this,
     }
   if (data->encap)
     {
-      DBG1 (DBG_KNL, "UDP encap");
+      /* NAT-T: the peer is reachable only on the port its NAT mapped
+       * for us. Using the SA endpoint ports (id->src / id->dst) gives:
+       *   inbound  SA: src=peer:<their ephemeral>  dst=us:4500
+       *   outbound SA: src=us:4500                 dst=peer:<their ephemeral>
+       * The old code hardcoded both to natt_port (4500), which works
+       * only when the peer is also exactly on 4500. When the peer is
+       * behind NAT with port translation (the common case), outbound
+       * ESP went to port 4500 and the NAT box had no mapping for it
+       * → replies were silently dropped at the NAT, the VPN client
+       * saw IKE come up but no decrypted traffic flowed back. */
+      uint16_t sport = id->src->get_port (id->src);
+      uint16_t dport = id->dst->get_port (id->dst);
+      if (sport == 0)
+	sport = natt_port; /* fallback if charon didn't fill it */
+      if (dport == 0)
+	dport = natt_port;
+      DBG1 (DBG_KNL, "UDP encap sport=%u dport=%u", sport, dport);
       flags |= IPSEC_API_SAD_FLAG_UDP_ENCAP;
-      mp->entry.udp_src_port = htons (natt_port);
-      mp->entry.udp_dst_port = htons (natt_port);
+      mp->entry.udp_src_port = htons (sport);
+      mp->entry.udp_dst_port = htons (dport);
     }
   mp->entry.flags = htonl (flags);
 
