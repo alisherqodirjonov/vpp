@@ -30,6 +30,19 @@ CFLAGS_I=-include $(CONFIGH) \
 	-I$(SWANDIR)/src/libstrongswan \
 	-I$(SWANDIR)/src/libcharon
 
+# VPP headers. The conditional block further down only adds -I$(VPPDIR)
+# when vppinfra.so is ABSENT from ldconfig, and $(VPPDIR)
+# (install-vpp-native/.../include) is not produced by every VPP build
+# layout — so on a box where VPP is in ldconfig but its headers are not
+# installed system-wide, the plugin fails to compile (vlibapi/api.h not
+# found). Point straight at the in-tree source + the generated
+# .api_*.h headers so the build works regardless of how VPP was set up.
+VPP_SRC_INC=$(CURDIR)/../../../src
+VPP_GEN_INC=$(CURDIR)/../../../build/CMakeFiles
+ifeq ($(shell test -d $(VPP_SRC_INC)/vlibapi && echo yes), yes)
+	CFLAGS_I += -I$(VPP_SRC_INC) -I$(VPP_GEN_INC)
+endif
+
 LDFLAGS= -lvppinfra \
 	-lvlibmemoryclient \
 	-lvlibapi \

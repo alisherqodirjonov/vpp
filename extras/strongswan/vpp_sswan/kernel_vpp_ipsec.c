@@ -167,6 +167,15 @@ struct private_kernel_vpp_ipsec_t
    * Connections to VPP Stats
    */
   stat_client_main_t *sm;
+
+  /**
+   * Set once query_sa() fails to reach VPP's stats segment. charon polls
+   * list-sas every few seconds; without this latch every poll would
+   * retry the (failing) stats connection and log about it, flooding the
+   * journal. When set, query_sa() returns NOT_FOUND immediately and
+   * silently — per-SA byte counters just read 0.
+   */
+  bool stats_unavailable;
 };
 
 /**
@@ -178,6 +187,14 @@ typedef struct
   uint32_t sa_id;
   uint32_t stat_index;
   kernel_ipsec_sa_id_t *sa_id_p;
+  /** strongSwan reqid of the owning CHILD_SA. Both the inbound and the
+   * outbound SA of one CHILD_SA share this value — it is how route-mode
+   * pairs them up (lookup_sa_pair). Unique per CHILD_SA, so two clients
+   * behind the same NAT — who share an outer IP — still resolve to
+   * distinct SA pairs. */
+  uint32_t reqid;
+  /** TRUE if this is the inbound SA of the pair, FALSE if outbound. */
+  bool inbound;
 } sa_t;
 
 /**
@@ -790,6 +807,50 @@ error:
 }
 
 /**
+ * Delete one ipsec-itf from VPP by sw_if_index.
+ *
+ * Shared by release_ipsec_itf() (refcount-driven teardown) and
+ * destroy() (plugin shutdown). Without the destroy()-time call, every
+ * ipsec-itf the plugin ever created would leak in VPP across a charon
+ * restart: the next charon instance starts with an empty ipsec_itfs
+ * table, so it never reuses — it creates a fresh interface and the old
+ * one lingers, still carrying a stale tunnel-protect bound to a now-
+ * dangling SA id. Over a few restarts VPP fills up with orphaned
+ * ipsecN interfaces.
+ */
+static void
+delete_ipsec_itf_vpp (uint32_t sw_if_index)
+{
+  vl_api_ipsec_itf_delete_t *mp = NULL;
+  vl_api_ipsec_itf_delete_reply_t *rmp = NULL;
+  char *out = NULL;
+  int out_len = 0;
+  u16 msg_id;
+
+  mp = vl_msg_api_alloc (sizeof (*mp));
+  memset (mp, 0, sizeof (*mp));
+  msg_id = vl_msg_api_get_msg_index ((u8 *) "ipsec_itf_delete_f9e6675e");
+  mp->_vl_msg_id = htons (msg_id);
+  mp->sw_if_index = htonl (sw_if_index);
+  if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac ipsec_itf_delete failed");
+      goto cleanup;
+    }
+  rmp = (void *) out;
+  if (rmp->retval)
+    DBG1 (DBG_KNL, "ipsec_itf_delete failed rv:%d", ntohl (rmp->retval));
+  else
+    DBG1 (DBG_KNL, "deleted ipsec-itf sw_if_index %d", sw_if_index);
+
+cleanup:
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+}
+
+/**
  * Decrement refcount on an ipsec-itf. When the last reference is gone,
  * delete the VPP interface and drop the table entry.
  */
@@ -798,11 +859,6 @@ release_ipsec_itf (private_kernel_vpp_ipsec_t *this, host_t *local)
 {
   char *key = NULL;
   ipsec_itf_t *itf = NULL;
-  char *out = NULL;
-  int out_len = 0;
-  vl_api_ipsec_itf_delete_t *mp = NULL;
-  vl_api_ipsec_itf_delete_reply_t *rmp = NULL;
-  u16 msg_id;
   uint32_t sw_if_index;
 
   key = itf_key_from_host (local);
@@ -828,27 +884,7 @@ release_ipsec_itf (private_kernel_vpp_ipsec_t *this, host_t *local)
   this->mutex->unlock (this->mutex);
   free (key);
 
-  mp = vl_msg_api_alloc (sizeof (*mp));
-  memset (mp, 0, sizeof (*mp));
-  msg_id = vl_msg_api_get_msg_index ((u8 *) "ipsec_itf_delete_f9e6675e");
-  mp->_vl_msg_id = htons (msg_id);
-  mp->sw_if_index = htonl (sw_if_index);
-  if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
-    {
-      DBG1 (DBG_KNL, "vac ipsec_itf_delete failed");
-      goto cleanup;
-    }
-  rmp = (void *) out;
-  if (rmp->retval)
-    DBG1 (DBG_KNL, "ipsec_itf_delete failed rv:%d", ntohl (rmp->retval));
-  else
-    DBG1 (DBG_KNL, "deleted ipsec-itf sw_if_index %d", sw_if_index);
-
-cleanup:
-  if (out)
-    free (out);
-  if (mp)
-    vl_msg_api_free (mp);
+  delete_ipsec_itf_vpp (sw_if_index);
 }
 
 /**
@@ -1049,17 +1085,24 @@ error:
 }
 
 /**
- * Look up the SA pair (in, out) for a CHILD_SA defined by the
- * (src, dst) tunnel endpoints. Returns SUCCESS if both SAs are found
- * in the plugin's SA table, FAILED otherwise.
+ * Look up the SA pair (in, out) for a CHILD_SA by its strongSwan reqid.
+ * Returns SUCCESS if both the inbound and the outbound SA are found in
+ * the plugin's SA table, FAILED otherwise.
  *
  * In route-mode this is called from manage_policy_route() to translate
  * "the policy charon is asking me to install" into "the SAD IDs I should
  * bind to the ipsec-itf".
+ *
+ * Why reqid and not the (src,dst) tunnel endpoints: two remote-access
+ * clients behind the same NAT present the SAME outer src/dst IP pair to
+ * the gateway. Matching SAs by IP would return whichever enumerates
+ * first — so a client's tunnel-protect would get bound to another
+ * client's keys. reqid is unique per CHILD_SA, so it pairs the right
+ * inbound+outbound SAs regardless of shared outer addresses.
  */
 static status_t
-lookup_sa_pair (private_kernel_vpp_ipsec_t *this, host_t *src, host_t *dst,
-		uint8_t proto, uint32_t *sa_in, uint32_t *sa_out)
+lookup_sa_pair (private_kernel_vpp_ipsec_t *this, uint32_t reqid,
+		uint32_t *sa_in, uint32_t *sa_out)
 {
   enumerator_t *e;
   kernel_ipsec_sa_id_t *id;
@@ -1070,21 +1113,17 @@ lookup_sa_pair (private_kernel_vpp_ipsec_t *this, host_t *src, host_t *dst,
   e = this->sas->create_enumerator (this->sas);
   while (e->enumerate (e, &id, &sa))
     {
-      if (id->proto != proto)
+      if (sa->reqid != reqid)
 	continue;
-      /* outbound SA: charon's src->dst matches our local->peer */
-      if (!found_out && id->src->ip_equals (id->src, src) &&
-	  id->dst->ip_equals (id->dst, dst))
-	{
-	  *sa_out = sa->sa_id;
-	  found_out = TRUE;
-	}
-      /* inbound SA: peer->local */
-      else if (!found_in && id->src->ip_equals (id->src, dst) &&
-	       id->dst->ip_equals (id->dst, src))
+      if (sa->inbound && !found_in)
 	{
 	  *sa_in = sa->sa_id;
 	  found_in = TRUE;
+	}
+      else if (!sa->inbound && !found_out)
+	{
+	  *sa_out = sa->sa_id;
+	  found_out = TRUE;
 	}
       if (found_in && found_out)
 	break;
@@ -1109,13 +1148,13 @@ manage_policy_route (private_kernel_vpp_ipsec_t *this, bool add,
 {
   uint32_t sw_if_index = ~0;
   uint32_t sa_in = ~0, sa_out = ~0;
+  uint32_t reqid;
   host_t *local = NULL, *peer = NULL;
   host_t *dst_net = NULL;
   uint8_t prefixlen;
   tp_key_t key, *stored_key = NULL;
   tunnel_protect_t *tp = NULL;
   status_t rv = FAILED;
-  uint8_t sa_proto;
 
   if (id->dir == POLICY_FWD)
     return SUCCESS;
@@ -1130,7 +1169,9 @@ manage_policy_route (private_kernel_vpp_ipsec_t *this, bool add,
     return SUCCESS;
 
   /* In route mode, charon's "src" is our local tunnel endpoint and "dst"
-   * is the peer. */
+   * is the peer's outer address. local keys the shared p2mp ipsec-itf.
+   * The peer's outer address is deliberately NOT used past this point —
+   * see the dst_net comment below. */
   local = data->src;
   peer = data->dst;
   if (!local || !peer || local->is_anyaddr (local) || peer->is_anyaddr (peer))
@@ -1138,7 +1179,28 @@ manage_policy_route (private_kernel_vpp_ipsec_t *this, bool add,
       DBG1 (DBG_KNL, "route_mode: anyaddr endpoint, skipping");
       return SUCCESS;
     }
-  sa_proto = data->sa->esp.use ? IPPROTO_ESP : IPPROTO_AH;
+  reqid = data->sa->reqid;
+
+  /* dst_net is the per-client virtual IP: charon narrows id->dst_ts to
+   * the assigned VIP /32 (the gateway's remote_ts must be 0.0.0.0/0 for
+   * this to happen). We use this VIP as BOTH the tunnel-protect
+   * next-hop and the FIB route prefix+next-hop — never the peer's outer
+   * address. Two remote-access clients behind the same NAT share an
+   * outer IP, so keying tunnel-protects/routes on it makes the second
+   * client overwrite the first. VIPs are always distinct, so keying on
+   * the VIP keeps them isolated on the one shared ipsec-itf. */
+  id->dst_ts->to_subnet (id->dst_ts, &dst_net, &prefixlen);
+  if (!dst_net || dst_net->is_anyaddr (dst_net))
+    {
+      DBG1 (DBG_KNL,
+	    "route_mode: policy dst_ts is not a concrete VIP (reqid %u) — "
+	    "the gateway's remote_ts must be 0.0.0.0/0 so charon narrows it "
+	    "to the assigned virtual IP; skipping",
+	    reqid);
+      if (dst_net)
+	dst_net->destroy (dst_net);
+      return add ? FAILED : SUCCESS;
+    }
 
   if (add)
     {
@@ -1146,55 +1208,55 @@ manage_policy_route (private_kernel_vpp_ipsec_t *this, bool add,
       if (sw_if_index == (uint32_t) ~0)
 	{
 	  DBG1 (DBG_KNL, "route_mode: ensure_ipsec_itf failed");
+	  dst_net->destroy (dst_net);
 	  return FAILED;
 	}
-      if (lookup_sa_pair (this, local, peer, sa_proto, &sa_in, &sa_out) !=
-	  SUCCESS)
+      if (lookup_sa_pair (this, reqid, &sa_in, &sa_out) != SUCCESS)
 	{
 	  DBG1 (DBG_KNL,
-		"route_mode: SA pair for %H<->%H proto %d not in table yet; "
+		"route_mode: SA pair for reqid %u not in table yet; "
 		"deferring (charon should add SAs before policy)",
-		local, peer, sa_proto);
+		reqid);
 	  release_ipsec_itf (this, local);
+	  dst_net->destroy (dst_net);
 	  return FAILED;
 	}
-      if (tunnel_protect_update (sw_if_index, peer, sa_in, sa_out) != SUCCESS)
+      if (tunnel_protect_update (sw_if_index, dst_net, sa_in, sa_out) !=
+	  SUCCESS)
 	{
 	  release_ipsec_itf (this, local);
+	  dst_net->destroy (dst_net);
 	  return FAILED;
 	}
 
-      INIT (tp, .sw_if_index = sw_if_index, .peer = peer->clone (peer),
+      /* tp_key_t / tunnel_protect_t .peer holds the VIP here, not the
+       * peer's outer address — see the dst_net comment above. */
+      INIT (tp, .sw_if_index = sw_if_index, .peer = dst_net->clone (dst_net),
 	    .sa_in = sa_in, .sa_out = sa_out, );
       INIT (stored_key, .sw_if_index = sw_if_index,
-	    .peer = peer->clone (peer), );
+	    .peer = dst_net->clone (dst_net), );
 
       this->mutex->lock (this->mutex);
       this->tunnel_protects->put (this->tunnel_protects, stored_key, tp);
       this->mutex->unlock (this->mutex);
 
-      id->dst_ts->to_subnet (id->dst_ts, &dst_net, &prefixlen);
-      if (dst_net && !dst_net->is_anyaddr (dst_net))
-	{
-	  if (route_via_ipsec_itf (TRUE, dst_net, prefixlen, sw_if_index,
-				   peer) != SUCCESS)
-	    DBG1 (DBG_KNL, "route_mode: route install failed (continuing)");
-	}
+      if (route_via_ipsec_itf (TRUE, dst_net, prefixlen, sw_if_index,
+			       dst_net) != SUCCESS)
+	DBG1 (DBG_KNL, "route_mode: route install failed (continuing)");
       rv = SUCCESS;
     }
   else
     {
       /* Delete: route -> tunnel-protect -> release itf ref. */
-      id->dst_ts->to_subnet (id->dst_ts, &dst_net, &prefixlen);
       sw_if_index = ensure_ipsec_itf (this, local);
-      if (sw_if_index != (uint32_t) ~0 && dst_net && !dst_net->is_anyaddr (dst_net))
-	route_via_ipsec_itf (FALSE, dst_net, prefixlen, sw_if_index, peer);
+      if (sw_if_index != (uint32_t) ~0)
+	route_via_ipsec_itf (FALSE, dst_net, prefixlen, sw_if_index, dst_net);
       /* ensure_ipsec_itf bumped refs by 1; balance it. */
       if (sw_if_index != (uint32_t) ~0)
 	release_ipsec_itf (this, local);
 
       key.sw_if_index = sw_if_index;
-      key.peer = peer;
+      key.peer = dst_net;
       this->mutex->lock (this->mutex);
       tp = this->tunnel_protects->remove (this->tunnel_protects, &key);
       this->mutex->unlock (this->mutex);
@@ -1208,8 +1270,7 @@ manage_policy_route (private_kernel_vpp_ipsec_t *this, bool add,
       rv = SUCCESS;
     }
 
-  if (dst_net)
-    dst_net->destroy (dst_net);
+  dst_net->destroy (dst_net);
   return rv;
 }
 
@@ -2233,6 +2294,48 @@ schedule_expiration (private_kernel_vpp_ipsec_t *this,
   lib->scheduler->schedule_job (lib->scheduler, (job_t *) job, timeout);
 }
 
+/**
+ * Delete an SA from VPP's SAD by sad_id (best-effort, no table state).
+ *
+ * Used by add_sa to clear a stale entry left over from a previous
+ * charon instance before retrying the add — see the
+ * ENTRY_ALREADY_EXISTS handling there.
+ */
+static void
+delete_sad_entry_vpp (uint32_t sad_id)
+{
+  vl_api_ipsec_sad_entry_add_del_t *mp = NULL;
+  vl_api_ipsec_sad_entry_add_del_reply_t *rmp = NULL;
+  char *out = NULL;
+  int out_len = 0;
+  u16 msg_id;
+
+  mp = vl_msg_api_alloc (sizeof (*mp));
+  memset (mp, 0, sizeof (*mp));
+  msg_id =
+    vl_msg_api_get_msg_index ((u8 *) "ipsec_sad_entry_add_del_ab64b5c6");
+  mp->_vl_msg_id = htons (msg_id);
+  mp->is_add = 0;
+  mp->entry.sad_id = htonl (sad_id);
+  if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
+    {
+      DBG1 (DBG_KNL, "vac delete stale SA failed");
+    }
+  else
+    {
+      rmp = (void *) out;
+      if (rmp->retval)
+	DBG1 (DBG_KNL, "delete stale SA sad_id %u rv:%d", sad_id,
+	      ntohl (rmp->retval));
+      else
+	DBG1 (DBG_KNL, "deleted stale SA sad_id %u", sad_id);
+    }
+  if (out)
+    free (out);
+  if (mp)
+    vl_msg_api_free (mp);
+}
+
 METHOD (kernel_ipsec_t, add_sa, status_t, private_kernel_vpp_ipsec_t *this,
 	kernel_ipsec_sa_id_t *id, kernel_ipsec_add_sa_t *data)
 {
@@ -2457,6 +2560,42 @@ METHOD (kernel_ipsec_t, add_sa, status_t, private_kernel_vpp_ipsec_t *this,
       goto error;
     }
   rmp = (void *) out;
+  /* -116 = VNET_API_ERROR_ENTRY_ALREADY_EXISTS. The plugin resets
+   * next_sad_id to 0 on every charon start, but VPP keeps SAs across a
+   * charon restart (and a crashed charon never cleans up at all) — so
+   * sad_id collides with a stale leftover.
+   *
+   * We try two things per collision:
+   *   1. delete the colliding sad_id — frees it cleanly IF the leftover
+   *      SA is unbound.
+   *   2. move to a FRESH sad_id and retry — needed because a leftover SA
+   *      that is still bound to a stale tunnel-protect is refcounted:
+   *      the is_add=0 delete only unlocks it, the SA stays, and re-using
+   *      the same id keeps failing. next_sad_id is monotonic, so a fresh
+   *      id walks past the whole leaked range.
+   * Bounded loop so a pathological VPP state can't spin forever. */
+  {
+    int tries = 0;
+    while (rmp->retval && (int) ntohl (rmp->retval) == -116 && tries < 16)
+      {
+	tries++;
+	DBG1 (DBG_KNL,
+	      "add SA: sad_id %u already in VPP (stale leftover); freeing it "
+	      "and retrying with a fresh id",
+	      sad_id);
+	delete_sad_entry_vpp (sad_id);
+	sad_id = ref_get (&this->next_sad_id);
+	mp->entry.sad_id = htonl (sad_id);
+	free (out);
+	out = NULL;
+	if (vac->send (vac, (char *) mp, sizeof (*mp), &out, &out_len))
+	  {
+	    DBG1 (DBG_KNL, "vac adding SA failed (retry)");
+	    goto error;
+	  }
+	rmp = (void *) out;
+      }
+  }
   if (rmp->retval)
     {
       DBG1 (DBG_KNL, "add SA failed rv:%d", ntohl (rmp->retval));
@@ -2467,7 +2606,7 @@ METHOD (kernel_ipsec_t, add_sa, status_t, private_kernel_vpp_ipsec_t *this,
   INIT (sa_id, .src = id->src->clone (id->src),
 	.dst = id->dst->clone (id->dst), .spi = id->spi, .proto = id->proto, );
   INIT (sa, .sa_id = sad_id, .stat_index = ntohl (rmp->stat_index),
-	.sa_id_p = sa_id, );
+	.sa_id_p = sa_id, .reqid = data->reqid, .inbound = data->inbound, );
   DBG4 (DBG_KNL, "put sa by its sa_id %x !!!!!!", sad_id);
   this->sas->put (this->sas, sa_id, sa);
   schedule_expiration (this, data, id);
@@ -2513,11 +2652,21 @@ METHOD (kernel_ipsec_t, query_sa, status_t, private_kernel_vpp_ipsec_t *this,
   if (this->sm == NULL)
     {
       stat_client_main_t *sm = NULL;
-      sm = stat_client_get ();
 
+      /* Stats segment already known unreachable — return silently
+       * without retrying or logging (charon polls this often). */
+      if (this->stats_unavailable)
+	{
+	  this->mutex->unlock (this->mutex);
+	  return NOT_FOUND;
+	}
+
+      sm = stat_client_get ();
       if (!sm)
 	{
-	  DBG1 (DBG_KNL, "Not connecting with stats segmentation");
+	  this->stats_unavailable = TRUE;
+	  DBG1 (DBG_KNL, "stats segment unavailable (per-SA byte counters "
+			 "will read 0); not retrying");
 	  this->mutex->unlock (this->mutex);
 	  return NOT_FOUND;
 	}
@@ -2527,7 +2676,9 @@ METHOD (kernel_ipsec_t, query_sa, status_t, private_kernel_vpp_ipsec_t *this,
 	{
 	  stat_client_free (this->sm);
 	  this->sm = NULL;
-	  DBG1 (DBG_KNL, "Not connecting with stats segmentation");
+	  this->stats_unavailable = TRUE;
+	  DBG1 (DBG_KNL, "stats segment unavailable at /run/vpp/stats.sock "
+			 "(per-SA byte counters will read 0); not retrying");
 	  this->mutex->unlock (this->mutex);
 	  return NOT_FOUND;
 	}
@@ -2648,7 +2799,13 @@ METHOD (kernel_ipsec_t, del_sa, status_t, private_kernel_vpp_ipsec_t *this,
   rv = SUCCESS;
 error:
   free (out);
-  vl_msg_api_free (mp);
+  /* mp is NULL when we jumped here from the "SA not found" early-out
+   * above (it is allocated only after that check). vl_msg_api_free()
+   * does NOT null-check its argument — passing NULL dereferences a
+   * bogus header and segfaults the whole charon process, which is
+   * exactly what charon does while cleaning up after add_sa fails. */
+  if (mp)
+    vl_msg_api_free (mp);
   this->mutex->unlock (this->mutex);
   return rv;
 }
@@ -2755,10 +2912,51 @@ METHOD (kernel_ipsec_t, destroy, void, private_kernel_vpp_ipsec_t *this)
   this->sas->destroy (this->sas);
   this->spds->destroy (this->spds);
   this->routes->destroy (this->routes);
+  /* Tear down every ipsec-itf we created before freeing the table.
+   * hashtable->destroy() only frees the table structure — it does NOT
+   * delete the VPP interfaces or free the entries. Without this loop
+   * each ipsec-itf leaks in VPP across a charon restart (see
+   * delete_ipsec_itf_vpp). This handles the graceful path (SIGTERM
+   * from `systemctl restart`); crash/SIGKILL is swept by sarhad-guard
+   * on the next gateway apply. */
   if (this->ipsec_itfs)
-    this->ipsec_itfs->destroy (this->ipsec_itfs);
+    {
+      enumerator_t *e;
+      char *key;
+      ipsec_itf_t *itf;
+
+      e = this->ipsec_itfs->create_enumerator (this->ipsec_itfs);
+      while (e->enumerate (e, &key, &itf))
+	{
+	  delete_ipsec_itf_vpp (itf->sw_if_index);
+	  free (itf->local_key);
+	  free (itf);
+	}
+      e->destroy (e);
+      this->ipsec_itfs->destroy (this->ipsec_itfs);
+    }
   if (this->tunnel_protects)
-    this->tunnel_protects->destroy (this->tunnel_protects);
+    {
+      enumerator_t *e;
+      tp_key_t *key;
+      tunnel_protect_t *tp;
+
+      /* The VPP tunnel-protect objects are gone with their ipsec-itfs
+       * above; just free the bookkeeping. Both the key and the value
+       * own a cloned peer host_t (see manage_policy_route). */
+      e = this->tunnel_protects->create_enumerator (this->tunnel_protects);
+      while (e->enumerate (e, &key, &tp))
+	{
+	  if (tp->peer)
+	    tp->peer->destroy (tp->peer);
+	  free (tp);
+	  if (key->peer)
+	    key->peer->destroy (key->peer);
+	  free (key);
+	}
+      e->destroy (e);
+      this->tunnel_protects->destroy (this->tunnel_protects);
+    }
   if (this->wan_interface)
     {
       free (this->wan_interface);
