@@ -459,7 +459,7 @@ vnet_send_dns_request (vlib_main_t * vm, dns_main_t * dm,
   dns_header_t *h;
   dns_query_t *qp;
   u16 tmp;
-  u8 *request, *name_copy;
+  u8 *request;
   u32 qp_offset;
 
   /* This can easily happen if sitting in GDB, etc. */
@@ -475,29 +475,21 @@ vnet_send_dns_request (vlib_main_t * vm, dns_main_t * dm,
        * per label is 63, enforce that.
        */
       request = name_to_labels (ep->name);
-      name_copy = vec_dup (request);
       qp_offset = vec_len (request);
 
       /*
-       * At least when testing against "known good" DNS servers:
-       * it turns out that sending 2x requests - one for an A-record
-       * and another for a AAAA-record - seems to work better than
-       * sending a DNS_TYPE_ALL request.
+       * Send a single A-record question. RFC 1035 allows qdcount > 1, but
+       * real-world resolvers (1.1.1.1, 8.8.8.8) handle multi-question queries
+       * inconsistently, and our own response parsers only skip one question
+       * section. Asking for just the A-record keeps both ends in agreement.
        */
 
       /* Add space for the query header */
-      vec_validate (request, 2 * qp_offset + 2 * sizeof (dns_query_t) - 1);
+      vec_validate (request, qp_offset + sizeof (dns_query_t) - 1);
 
       qp = (dns_query_t *) (request + qp_offset);
 
       qp->type = clib_host_to_net_u16 (DNS_TYPE_A);
-      qp->class = clib_host_to_net_u16 (DNS_CLASS_IN);
-      qp++;
-      clib_memcpy (qp, name_copy, vec_len (name_copy));
-      qp = (dns_query_t *) (((u8 *) qp) + vec_len (name_copy));
-      vec_free (name_copy);
-
-      qp->type = clib_host_to_net_u16 (DNS_TYPE_AAAA);
       qp->class = clib_host_to_net_u16 (DNS_CLASS_IN);
 
       /* Punch in space for the dns_header_t */
@@ -511,7 +503,7 @@ vnet_send_dns_request (vlib_main_t * vm, dns_main_t * dm,
       /* Ask for a recursive lookup */
       tmp = DNS_RD | DNS_OPCODE_QUERY;
       h->flags = clib_host_to_net_u16 (tmp);
-      h->qdcount = clib_host_to_net_u16 (2);
+      h->qdcount = clib_host_to_net_u16 (1);
       h->nscount = 0;
       h->arcount = 0;
 
@@ -893,7 +885,6 @@ vnet_dns_cname_indirection_nolock (vlib_main_t * vm, dns_main_t * dm,
   int len, i;
   u8 *cname = 0;
   u8 *request = 0;
-  u8 *name_copy;
   u32 qp_offset;
   u16 flags;
   u16 rcode;
@@ -1028,22 +1019,14 @@ found_last_request:
 #undef _
 
   request = name_to_labels (cname);
-  name_copy = vec_dup (request);
-
   qp_offset = vec_len (request);
 
-  /* Add space for the query header */
-  vec_validate (request, 2 * qp_offset + 2 * sizeof (dns_query_t) - 1);
+  /* Single A-record question; see vnet_send_dns_request for rationale. */
+  vec_validate (request, qp_offset + sizeof (dns_query_t) - 1);
 
   qp = (dns_query_t *) (request + qp_offset);
 
   qp->type = clib_host_to_net_u16 (DNS_TYPE_A);
-  qp->class = clib_host_to_net_u16 (DNS_CLASS_IN);
-  clib_memcpy (qp, name_copy, vec_len (name_copy));
-  qp = (dns_query_t *) (((u8 *) qp) + vec_len (name_copy));
-  vec_free (name_copy);
-
-  qp->type = clib_host_to_net_u16 (DNS_TYPE_AAAA);
   qp->class = clib_host_to_net_u16 (DNS_CLASS_IN);
 
   /* Punch in space for the dns_header_t */
@@ -1056,7 +1039,7 @@ found_last_request:
 
   /* Ask for a recursive lookup */
   h->flags = clib_host_to_net_u16 (DNS_RD | DNS_OPCODE_QUERY);
-  h->qdcount = clib_host_to_net_u16 (2);
+  h->qdcount = clib_host_to_net_u16 (1);
   h->nscount = 0;
   h->arcount = 0;
 

@@ -164,6 +164,16 @@ struct private_kernel_vpp_ipsec_t
   char *wan_interface;
 
   /**
+   * Filesystem path to VPP's stats segment socket. Read from
+   * charon.plugins.kernel-vpp.stats_socket; defaults to
+   * /run/vpp/stats.sock when unset. query_sa() connects here to read
+   * per-SA byte/packet counters; if the path doesn't match what VPP
+   * actually exposes in its startup.conf statseg{} stanza, the
+   * counters in `swanctl --list-sas` and the live-sessions UI stay 0.
+   */
+  char *stats_socket;
+
+  /**
    * Connections to VPP Stats
    */
   stat_client_main_t *sm;
@@ -888,12 +898,24 @@ release_ipsec_itf (private_kernel_vpp_ipsec_t *this, host_t *local)
 }
 
 /**
- * Issue an ipsec_tunnel_protect_update for (sw_if_index, peer) with the
- * given SA pair. The message carries a VLA of inbound SA ids; for now we
- * pass exactly one (rekey overlap handling is a follow-up).
+ * Issue an ipsec_tunnel_protect_update for (sw_if_index, peer/nh) with
+ * the given sa_out and the given list of inbound SAs. Multiple inbound
+ * SAs are used during a CHILD_SA rekey: the caller passes BOTH the old
+ * and the new inbound SA so VPP keeps accepting packets sent under the
+ * old SPI for the brief window between the new SAs being installed and
+ * charon issuing del_sa for the old ones. Without this, ESP traffic
+ * arriving with the old SPI during that window is silently dropped —
+ * a routine ~50ms blip every rekey interval.
+ *
+ * VPP's tunnel_protect_update REPLACES the inbound SA list atomically:
+ * the previous list's SAs are unlocked and the new list's SAs are
+ * locked. So passing [old, new] in one update and later [new, newer]
+ * in the next cleanly releases the truly-stale old SA on the next
+ * call — no manual reference tracking required on our side.
  */
 static status_t
-tunnel_protect_update (uint32_t sw_if_index, host_t *peer, uint32_t sa_in,
+tunnel_protect_update (uint32_t sw_if_index, host_t *peer,
+		       const uint32_t *sa_in, uint8_t n_sa_in,
 		       uint32_t sa_out)
 {
   vl_api_ipsec_tunnel_protect_update_t *mp = NULL;
@@ -904,9 +926,17 @@ tunnel_protect_update (uint32_t sw_if_index, host_t *peer, uint32_t sa_in,
   u16 msg_id;
   size_t msg_size;
   chunk_t addr;
+  uint8_t i;
 
-  /* sa_in[] is a VLA at the end of the message; size for n_sa_in = 1 */
-  msg_size = sizeof (*mp) + sizeof (uint32_t);
+  if (n_sa_in == 0 || n_sa_in > 4)
+    {
+      DBG1 (DBG_KNL, "tunnel_protect_update: n_sa_in %u out of range",
+	    n_sa_in);
+      return FAILED;
+    }
+
+  /* sa_in[] is a VLA at the end of the message; size for n_sa_in. */
+  msg_size = sizeof (*mp) + (size_t) n_sa_in * sizeof (uint32_t);
   mp = vl_msg_api_alloc (msg_size);
   memset (mp, 0, msg_size);
   msg_id =
@@ -914,8 +944,9 @@ tunnel_protect_update (uint32_t sw_if_index, host_t *peer, uint32_t sa_in,
   mp->_vl_msg_id = htons (msg_id);
   mp->tunnel.sw_if_index = htonl (sw_if_index);
   mp->tunnel.sa_out = htonl (sa_out);
-  mp->tunnel.n_sa_in = 1;
-  mp->tunnel.sa_in[0] = htonl (sa_in);
+  mp->tunnel.n_sa_in = n_sa_in;
+  for (i = 0; i < n_sa_in; i++)
+    mp->tunnel.sa_in[i] = htonl (sa_in[i]);
 
   addr = peer->get_address (peer);
   /* af is a u8 enum (vl_api_address_family_t) — direct assign, no htonl. */
@@ -942,9 +973,17 @@ tunnel_protect_update (uint32_t sw_if_index, host_t *peer, uint32_t sa_in,
 	    ntohl (rmp->retval));
       goto error;
     }
-  DBG2 (DBG_KNL, "tunnel-protect bound on sw_if_index %d nh %H sa_in %d "
-		 "sa_out %d",
-	sw_if_index, peer, sa_in, sa_out);
+  /* Log at DBG1 so operators can trace rekey overlap: n_sa_in > 1 means
+   * we're in a rekey window (old + new accepted). */
+  if (n_sa_in == 1)
+    DBG1 (DBG_KNL, "tunnel-protect bound on sw_if_index %d nh %H "
+		   "sa_in %u sa_out %u",
+	  sw_if_index, peer, sa_in[0], sa_out);
+  else
+    DBG1 (DBG_KNL, "tunnel-protect bound on sw_if_index %d nh %H "
+		   "sa_in [%u,%u%s] sa_out %u (rekey overlap)",
+	  sw_if_index, peer, sa_in[0], sa_in[1],
+	  n_sa_in > 2 ? ",..." : "", sa_out);
   rv = SUCCESS;
 
 error:
@@ -1109,24 +1148,34 @@ lookup_sa_pair (private_kernel_vpp_ipsec_t *this, uint32_t reqid,
   sa_t *sa;
   bool found_in = FALSE, found_out = FALSE;
 
+  /* Pick the NEWEST inbound + outbound SA for this reqid (highest
+   * sa_id). On a CHILD_SA rekey both the old and the new SA pair share
+   * the same reqid — we want the new pair, which always has the
+   * higher sa_id since next_sad_id is monotonic. Picking "first
+   * enumerated" was racy/wrong: hashtable order is arbitrary, so we
+   * could bind a fresh policy to the previous pair's keys. */
   this->mutex->lock (this->mutex);
   e = this->sas->create_enumerator (this->sas);
   while (e->enumerate (e, &id, &sa))
     {
       if (sa->reqid != reqid)
 	continue;
-      if (sa->inbound && !found_in)
+      if (sa->inbound)
 	{
-	  *sa_in = sa->sa_id;
-	  found_in = TRUE;
+	  if (!found_in || sa->sa_id > *sa_in)
+	    {
+	      *sa_in = sa->sa_id;
+	      found_in = TRUE;
+	    }
 	}
-      else if (!sa->inbound && !found_out)
+      else
 	{
-	  *sa_out = sa->sa_id;
-	  found_out = TRUE;
+	  if (!found_out || sa->sa_id > *sa_out)
+	    {
+	      *sa_out = sa->sa_id;
+	      found_out = TRUE;
+	    }
 	}
-      if (found_in && found_out)
-	break;
     }
   e->destroy (e);
   this->mutex->unlock (this->mutex);
@@ -1221,8 +1270,30 @@ manage_policy_route (private_kernel_vpp_ipsec_t *this, bool add,
 	  dst_net->destroy (dst_net);
 	  return FAILED;
 	}
-      if (tunnel_protect_update (sw_if_index, dst_net, sa_in, sa_out) !=
-	  SUCCESS)
+
+      /* CHILD_SA rekey overlap: if a tunnel-protect already exists for
+       * this (sw_if_index, VIP) — i.e. the CHILD_SA is being rekeyed —
+       * include the previous binding's inbound SA in the new tp's
+       * sa_in[] list. VPP keeps decrypting traffic that still arrives
+       * on the old SPI for the brief window between charon installing
+       * the new SAs and issuing del_sa for the old ones; the previous
+       * old SA is cleanly unlocked by VPP on the next update call. */
+      uint32_t sa_ins[2];
+      uint8_t n_sa_ins = 0;
+      {
+	tp_key_t lookup_key = { .sw_if_index = sw_if_index,
+				.peer = dst_net };
+	this->mutex->lock (this->mutex);
+	tunnel_protect_t *existing =
+	  this->tunnel_protects->get (this->tunnel_protects, &lookup_key);
+	if (existing && existing->sa_in != sa_in)
+	  sa_ins[n_sa_ins++] = existing->sa_in;
+	this->mutex->unlock (this->mutex);
+      }
+      sa_ins[n_sa_ins++] = sa_in;
+
+      if (tunnel_protect_update (sw_if_index, dst_net, sa_ins, n_sa_ins,
+				 sa_out) != SUCCESS)
 	{
 	  release_ipsec_itf (this, local);
 	  dst_net->destroy (dst_net);
@@ -1237,8 +1308,18 @@ manage_policy_route (private_kernel_vpp_ipsec_t *this, bool add,
 	    .peer = dst_net->clone (dst_net), );
 
       this->mutex->lock (this->mutex);
-      this->tunnel_protects->put (this->tunnel_protects, stored_key, tp);
+      /* put replaces if the key is already present (= rekey) and
+       * returns the previous value. Free it so we don't leak a tp
+       * (and its cloned peer host_t) per rekey. */
+      tunnel_protect_t *old_tp =
+	this->tunnel_protects->put (this->tunnel_protects, stored_key, tp);
       this->mutex->unlock (this->mutex);
+      if (old_tp)
+	{
+	  if (old_tp->peer)
+	    old_tp->peer->destroy (old_tp->peer);
+	  free (old_tp);
+	}
 
       if (route_via_ipsec_itf (TRUE, dst_net, prefixlen, sw_if_index,
 			       dst_net) != SUCCESS)
@@ -2671,14 +2752,17 @@ METHOD (kernel_ipsec_t, query_sa, status_t, private_kernel_vpp_ipsec_t *this,
 	  return NOT_FOUND;
 	}
       this->sm = sm;
-      int rv_stat = stat_segment_connect_r ("/run/vpp/stats.sock", this->sm);
+      const char *sock_path = this->stats_socket ? this->stats_socket
+						 : "/run/vpp/stats.sock";
+      int rv_stat = stat_segment_connect_r (sock_path, this->sm);
       if (rv_stat != 0)
 	{
 	  stat_client_free (this->sm);
 	  this->sm = NULL;
 	  this->stats_unavailable = TRUE;
-	  DBG1 (DBG_KNL, "stats segment unavailable at /run/vpp/stats.sock "
-			 "(per-SA byte counters will read 0); not retrying");
+	  DBG1 (DBG_KNL, "stats segment unavailable at %s "
+			 "(per-SA byte counters will read 0); not retrying",
+		sock_path);
 	  this->mutex->unlock (this->mutex);
 	  return NOT_FOUND;
 	}
@@ -2962,6 +3046,11 @@ METHOD (kernel_ipsec_t, destroy, void, private_kernel_vpp_ipsec_t *this)
       free (this->wan_interface);
       this->wan_interface = NULL;
     }
+  if (this->stats_socket)
+    {
+      free (this->stats_socket);
+      this->stats_socket = NULL;
+    }
   if (this->sm)
     {
       stat_segment_disconnect_r (this->sm);
@@ -3017,6 +3106,7 @@ kernel_vpp_ipsec_create ()
         .tunnel_protects = hashtable_create((hashtable_hash_t)tp_hash,
                                             (hashtable_equals_t)tp_equals, 16),
         .wan_interface = NULL,
+        .stats_socket = NULL,
         .sm = NULL,
     );
 
@@ -3026,12 +3116,21 @@ kernel_vpp_ipsec_create ()
     if (wan && *wan)
       this->wan_interface = strdup (wan);
   }
+  {
+    char *sock = lib->settings->get_str(lib->settings,
+                  "%s.plugins.kernel-vpp.stats_socket", NULL, lib->ns);
+    if (sock && *sock)
+      this->stats_socket = strdup (sock);
+  }
 
   if (this->route_mode)
     DBG1 (DBG_KNL, "kernel-vpp: route_mode ENABLED "
-                   "(SPD bypassed, using ipsec-itf + tunnel-protect)%s%s",
+                   "(SPD bypassed, using ipsec-itf + tunnel-protect)%s%s"
+                   ", stats=%s",
                    this->wan_interface ? ", unnumber-to=" : "",
-                   this->wan_interface ? this->wan_interface : "");
+                   this->wan_interface ? this->wan_interface : "",
+                   this->stats_socket ? this->stats_socket
+                                      : "/run/vpp/stats.sock (default)");
 
   if (!init_spi (this))
     {

@@ -153,6 +153,7 @@ dns46_request_inline (vlib_main_t * vm,
 	  u16 flags0;
 	  u32 pool_index0 = ~0;
 	  u8 *name0;
+	  u8 *c_name0;
 	  u8 *label0;
 
 	  /* speculatively enqueue b0 to the current next frame */
@@ -237,11 +238,17 @@ dns46_request_inline (vlib_main_t * vm,
 			      sizeof (ip4_address_t));
 
 	  /*
-	   * vnet_dns_labels_to_name produces a non NULL terminated vector
-	   * vnet_dns_resolve_name expects a C-string.
+	   * vnet_dns_labels_to_name produces a non NULL terminated vector.
+	   * vnet_dns_resolve_name expects a C-string, but the NULL must NOT
+	   * leak into t0->name: that vector is reused verbatim as the reply's
+	   * DNS question section, and a trailing NULL makes resolvers (e.g.
+	   * dig) reject the answer as a "question section mismatch". Pass a
+	   * private NULL-terminated copy for the cache lookup instead.
 	   */
-	  vec_add1 (name0, 0);
-	  vnet_dns_resolve_name (vm, dm, name0, t0, &ep0);
+	  c_name0 = vec_dup (name0);
+	  vec_add1 (c_name0, 0);
+	  vnet_dns_resolve_name (vm, dm, c_name0, t0, &ep0);
+	  vec_free (c_name0);
 
 	  if (ep0)
 	    {
