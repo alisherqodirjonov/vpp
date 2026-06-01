@@ -398,10 +398,47 @@ get_route (private_kernel_vpp_net_t *this, host_t *dest, int prefix,
 	}
       else
 	{
-	  if (src)
+	  /* get_source_addr: derive a usable source IP from the egress
+	   * interface's address list. If src was provided as a preferred
+	   * source and exists on that interface, return it; otherwise return
+	   * the first address of the matching family. */
+	  this->mutex->lock (this->mutex);
+	  enumerator = this->ifaces->create_enumerator (this->ifaces);
+	  while (enumerator->enumerate (enumerator, &entry))
 	    {
-	      addr = src->clone (src);
+	      enumerator_t *addrs_enum;
+	      host_t *host, *first = NULL;
+
+	      if (entry->index != path.sw_if_index)
+		{
+		  continue;
+		}
+	      addrs_enum = entry->addrs->create_enumerator (entry->addrs);
+	      while (addrs_enum->enumerate (addrs_enum, &host))
+		{
+		  if (host->get_family (host) != family)
+		    {
+		      continue;
+		    }
+		  if (src && host->ip_equals (host, src))
+		    {
+		      addr = host->clone (host);
+		      break;
+		    }
+		  if (!first)
+		    {
+		      first = host;
+		    }
+		}
+	      addrs_enum->destroy (addrs_enum);
+	      if (!addr && first)
+		{
+		  addr = first->clone (first);
+		}
+	      break;
 	    }
+	  enumerator->destroy (enumerator);
+	  this->mutex->unlock (this->mutex);
 	}
     }
 
