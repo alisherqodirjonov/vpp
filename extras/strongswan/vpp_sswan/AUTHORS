@@ -1,0 +1,13 @@
+Authors and copyright holders of the strongSwan "kernel-vpp" plugin
+===================================================================
+
+  Copyright (c) 2022 Intel and/or its affiliates.
+  Originally authored by Matus Fabian <matfabia@cisco.com> (Cisco Systems).
+  Based on: https://github.com/matfabia/strongswan
+  Appliance integration: the Sarhad Guard project.
+
+This plugin links against and is a derivative work of strongSwan
+(https://www.strongswan.org/), copyright the strongSwan project / secunet
+Security Networks AG, and uses the VPP C API (https://fd.io/).
+
+See LICENSING.md for the licensing of the resulting binary.

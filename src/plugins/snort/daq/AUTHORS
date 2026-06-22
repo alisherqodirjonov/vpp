@@ -1,0 +1,15 @@
+Authors and copyright holders of the VPP DAQ module (daq_vpp)
+=============================================================
+
+  Copyright (C) 2021-2025 Cisco Systems, Inc. and/or its affiliates.
+  All rights reserved.
+
+This is a DAQ (Data AcQuisition) module for Snort 3. It links against and is a
+derivative work of libdaq (https://github.com/snort3/libdaq), which is licensed
+under the GNU General Public License, version 2. Accordingly, this module is
+licensed under the GNU General Public License, version 2 (GPL-2.0-only), as
+stated in the header of every source file in this directory and in the LICENSE /
+COPYING files here.
+
+It bridges Snort 3 to the FD.io VPP data plane over a shared-memory Unix socket
+(see daq_vpp_shared.h). Project: https://github.com/snort3 ; https://fd.io/

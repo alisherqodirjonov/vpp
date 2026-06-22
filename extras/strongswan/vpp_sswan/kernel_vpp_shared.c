@@ -13,6 +13,19 @@
  * limitations under the License.
  */
 
+/*
+ * SPDX-License-Identifier: Apache-2.0 AND GPL-2.0-or-later
+ *
+ * NOTE (Sarhad-Guard distribution): this file is part of the strongSwan
+ * "kernel-vpp" plugin, which #includes and links strongSwan (libstrongswan /
+ * libcharon, GPL-2.0-or-later). The resulting binary
+ * (libstrongswan-kernel-vpp.so) is therefore a derivative work of strongSwan
+ * and is distributed under the GNU GPL (v2 or later). The Apache-2.0 grant
+ * above is preserved for this file's original contribution and is retained per
+ * Apache-2.0 sec. 4. See LICENSE, COPYING, AUTHORS and LICENSING.md in this
+ * directory.
+ */
+
 #include <library.h>
 #include <utils/debug.h>
 #include <threading/thread.h>

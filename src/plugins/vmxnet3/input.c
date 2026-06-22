@@ -213,7 +213,7 @@ vmxnet3_device_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
   u32 next_index = VNET_DEVICE_INPUT_NEXT_ETHERNET_INPUT;
   u8 known_next = 0, got_packet = 0;
   vmxnet3_rx_desc *rxd;
-  clib_error_t *error;
+  int error;
   u16 gso_size = 0;
 
   rxq = vec_elt_at_index (vd->rxqs, qid);

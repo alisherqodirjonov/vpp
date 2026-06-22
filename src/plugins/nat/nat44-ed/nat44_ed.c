@@ -104,12 +104,25 @@ VNET_FEATURE_INIT (ip4_nat_handoff_classify, static) = {
 VNET_FEATURE_INIT (snat_in2out_worker_handoff, static) = {
   .arc_name = "ip4-unicast",
   .node_name = "nat44-in2out-worker-handoff",
-  .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-fa"),
+  /* Must run after sv-reassembly: the handoff picks the session's worker from
+   * vnet_buffer.ip.reass.l4_*_port, which sv-reassembly populates. Without this
+   * constraint the order is undetermined (it only worked when
+   * ip4-dhcp-client-detect happened to be on the arc), so on interfaces without
+   * a VPP DHCP client the handoff ran first, read ports=0, and steered flows to
+   * the wrong worker. Matches nat44-ed-in2out's runs_after. */
+  .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-fa",
+                               "ip4-sv-reassembly-feature"),
 };
 VNET_FEATURE_INIT (snat_out2in_worker_handoff, static) = {
   .arc_name = "ip4-unicast",
   .node_name = "nat44-out2in-worker-handoff",
+  /* Must run after sv-reassembly (see snat_in2out_worker_handoff). The missing
+   * ip4-sv-reassembly-feature here is what broke multi-worker NAT return traffic
+   * on interfaces without ip4-dhcp-client-detect (static-IP WAN): the out2in
+   * handoff read reass.l4_*_port=0, the flow-hash session lookup missed, and
+   * replies were steered to the wrong worker and punted. Matches nat44-ed-out2in. */
   .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-fa",
+                               "ip4-sv-reassembly-feature",
                                "ip4-dhcp-client-detect"),
 };
 VNET_FEATURE_INIT (ip4_nat44_ed_in2out, static) = {

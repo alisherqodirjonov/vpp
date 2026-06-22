@@ -701,7 +701,7 @@ vmxnet3_rx_ring_advance_produce (vmxnet3_rxq_t * rxq, vmxnet3_rx_ring * ring)
     }
 }
 
-static_always_inline clib_error_t *
+static_always_inline int
 vmxnet3_rxq_refill_ring0 (vlib_main_t * vm, vmxnet3_device_t * vd,
 			  vmxnet3_rxq_t * rxq)
 {
@@ -725,7 +725,7 @@ vmxnet3_rxq_refill_ring0 (vlib_main_t * vm, vmxnet3_device_t * vd,
       if (n_alloc)
 	vlib_buffer_free_from_ring (vm, ring->bufs, ring->produce, rxq->size,
 				    n_alloc);
-      return clib_error_return (0, "buffer alloc failed");
+      return -1;
     }
 
   while (n_alloc)
@@ -747,7 +747,7 @@ vmxnet3_rxq_refill_ring0 (vlib_main_t * vm, vmxnet3_device_t * vd,
   return 0;
 }
 
-static_always_inline clib_error_t *
+static_always_inline int
 vmxnet3_rxq_refill_ring1 (vlib_main_t * vm, vmxnet3_device_t * vd,
 			  vmxnet3_rxq_t * rxq)
 {
@@ -771,7 +771,7 @@ vmxnet3_rxq_refill_ring1 (vlib_main_t * vm, vmxnet3_device_t * vd,
       if (n_alloc)
 	vlib_buffer_free_from_ring (vm, ring->bufs, ring->produce, rxq->size,
 				    n_alloc);
-      return clib_error_return (0, "buffer alloc failed");
+      return -1;
     }
 
   while (n_alloc)
