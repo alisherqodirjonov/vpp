@@ -179,3 +179,7 @@ compile_commands.json
 
 # log file archives
 /archives
+
+# strongswan vpp_sswan build artifacts (regenerated from .c/.h sources)
+/extras/strongswan/vpp_sswan/*.o
+/extras/strongswan/vpp_sswan/*.so

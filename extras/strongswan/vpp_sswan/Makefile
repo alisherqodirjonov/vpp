@@ -43,7 +43,15 @@ ifeq ($(shell test -d $(VPP_SRC_INC)/vlibapi && echo yes), yes)
 	CFLAGS_I += -I$(VPP_SRC_INC) -I$(VPP_GEN_INC)
 endif
 
-LDFLAGS= -lvppinfra \
+# Link against the IN-TREE VPP build (build/lib), NOT whatever stale VPP may be
+# in ldconfig (e.g. an old `make install` under /usr/local/lib). The appliance
+# ships VPP from build/, so this plugin MUST record the same lib SONAMEs — else
+# charon can't load it ("libvppinfra.so.X.Y: cannot open shared object file").
+# -L must precede -l so build/ wins over the system search path. -rpath-link is
+# link-time only (no dev path baked into the shipped .so).
+VPP_BUILD_LIB=$(CURDIR)/../../../build/lib/x86_64-linux-gnu
+LDFLAGS= -L$(VPP_BUILD_LIB) -Wl,-rpath-link=$(VPP_BUILD_LIB) \
+	-lvppinfra \
 	-lvlibmemoryclient \
 	-lvlibapi \
 	-lsvm \
