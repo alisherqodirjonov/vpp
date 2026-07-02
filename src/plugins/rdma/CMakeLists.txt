@@ -72,4 +72,6 @@ add_vpp_plugin(rdma
 
   LINK_LIBRARIES
   ${IBVERBS_LIB}
+  nl-3
+  nl-route-3
 )

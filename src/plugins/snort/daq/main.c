@@ -251,6 +251,11 @@ daq_vpp_instantiate (DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstance_h modinst,
   ctx = calloc (1, sizeof (daq_vpp_ctx_t));
   ctx->modinst = modinst;
   ctx->timeout = (int) vdm->daq_base_api.config_get_timeout (modcfg);
+  /* Busy-poll: never block in epoll_wait. Blocking on the eventfd costs a
+   * wakeup/context-switch per burst; while snort sleeps, VPP overruns the
+   * ring and drops at snort-enq. Spinning drains the ring continuously.
+   * Requires dedicated cores for the snort packet threads. */
+  ctx->timeout = 0;
   ctx->instance_id = instance_id;
 
   if (input_name_len >= DAQ_VPP_MAX_INST_NAME_LEN)
