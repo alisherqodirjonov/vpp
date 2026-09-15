@@ -26,10 +26,17 @@
 
 #include <vlibapi/api_helper_macros.h>
 
-int
-vnet_dns_response_to_reply (u8 * response,
-			    vl_api_dns_resolve_name_reply_t * rmp,
-			    u32 * min_ttlp);
+/*
+ * NB: vnet_dns_response_to_reply () takes a dns_resolve_name_t *, NOT the
+ * reply message. This file used to re-declare it locally with the message
+ * type, which the compiler cannot catch across translation units -- so the
+ * address was written straight over _vl_msg_id / context / retval and
+ * ip4_set / ip6_set were never set. Every name that needed an upstream
+ * lookup (i.e. everything not already cached or pinned) came back as a
+ * corrupt reply with no address in it.
+ */
+int vnet_dns_response_to_reply (u8 *response, dns_resolve_name_t *rn,
+				u32 *min_ttlp);
 int
 vnet_dns_response_to_name (u8 * response,
 			   vl_api_dns_resolve_ip_reply_t * rmp,
@@ -178,20 +185,38 @@ reply:
 	case DNS_API_PENDING_NAME_TO_IP:
 	  {
 	    vl_api_dns_resolve_name_reply_t *rmp;
+	    dns_resolve_name_t rn = { 0 };
+
 	    regp = vl_api_client_index_to_registration (pr->client_index);
 	    if (regp == 0)
 	      continue;
 
+	    /* Parse into our own struct first, then fill the reply. */
+	    min_ttl = ~0;
+	    rv = vnet_dns_response_to_reply (ep->dns_response, &rn, &min_ttl);
+	    if (min_ttl != ~0)
+	      ep->expiration_time = now + min_ttl;
+
 	    rmp = vl_msg_api_alloc (sizeof (*rmp));
+	    clib_memset (rmp, 0, sizeof (*rmp));
 	    rmp->_vl_msg_id =
 	      clib_host_to_net_u16 (VL_API_DNS_RESOLVE_NAME_REPLY
 				    + dm->msg_id_base);
 	    rmp->context = pr->client_context;
-	    min_ttl = ~0;
-	    rv = vnet_dns_response_to_reply (ep->dns_response, rmp, &min_ttl);
-	    if (min_ttl != ~0)
-	      ep->expiration_time = now + min_ttl;
 	    rmp->retval = clib_host_to_net_u32 (rv);
+	    if (rv == 0)
+	      {
+		if (ip_addr_version (&rn.address) == AF_IP4)
+		  {
+		    ip_address_copy_addr (rmp->ip4_address, &rn.address);
+		    rmp->ip4_set = 1;
+		  }
+		else
+		  {
+		    ip_address_copy_addr (rmp->ip6_address, &rn.address);
+		    rmp->ip6_set = 1;
+		  }
+	      }
 	    vl_api_send_msg (regp, (u8 *) rmp);
 	  }
 	  break;
@@ -220,6 +245,11 @@ reply:
 
 	case DNS_PEER_PENDING_IP_TO_NAME:
 	case DNS_PEER_PENDING_NAME_TO_IP:
+	  /* The other half of the query log: these are the names that were
+	     not in the cache when the client asked, so the request node
+	     could not log them. ep->name is the normalized cache key. */
+	  dns_log_query (vm->thread_index, ep->name, pr->is_ip6,
+			 pr->dst_address, ep);
 	  if (pr->is_ip6)
 	    vnet_send_dns6_reply (vm, dm, pr, ep, 0 /* allocate a buffer */ );
 	  else
@@ -289,6 +319,33 @@ retry_scan (vlib_main_t * vm, dns_main_t * dm, f64 now)
 {
   int i;
   dns_cache_entry_t *ep;
+  u32 *give_up = 0;
+  u32 n_servers;
+  u32 max_retries;
+
+  /*
+   * Bound the retries.
+   *
+   * This used to re-send every unresolved name every 2 seconds forever:
+   * retry_count existed and DNS_RETRIES_PER_SERVER was defined, but nothing
+   * ever incremented the counter here. An upstream that does not answer --
+   * no route back, a NAT that drops the reply, a firewalled resolver --
+   * therefore produced a cache entry that never resolved and never expired,
+   * silently. Every later query for that name attached to the same stuck
+   * entry, so it hung too, while names already in the cache kept answering
+   * instantly. That combination is very hard to read from the outside: the
+   * resolver looks half-working rather than broken.
+   *
+   * Now each pass counts, the server rotates every DNS_RETRIES_PER_SERVER
+   * attempts, and once every server has had its turn the entry is dropped
+   * with one clear log line naming the servers that did not reply.
+   * Dropping it matters as much as the log: the next query for that name
+   * starts a fresh resolution instead of joining a dead one.
+   */
+  n_servers = vec_len (dm->ip4_name_servers) + vec_len (dm->ip6_name_servers);
+  if (n_servers == 0)
+    n_servers = 1;
+  max_retries = DNS_RETRIES_PER_SERVER * n_servers;
 
   for (i = 0; i < vec_len (dm->unresolved_entries); i++)
     {
@@ -296,9 +353,44 @@ retry_scan (vlib_main_t * vm, dns_main_t * dm, f64 now)
       ep = pool_elt_at_index (dm->entries, dm->unresolved_entries[i]);
 
       ASSERT ((ep->flags & DNS_CACHE_ENTRY_FLAG_VALID) == 0);
+
+      ep->retry_count++;
+
+      if (ep->retry_count > max_retries)
+	{
+	  clib_warning (
+	    "dns: giving up on '%s' after %u attempts -- no upstream server "
+	    "replied. The query is being sent (a source address was found), "
+	    "so check the RETURN path: a route back, and whether NAT is "
+	    "translating the reply.",
+	    ep->name, ep->retry_count - 1);
+	  /* Collect; deleting here would mutate unresolved_entries mid-walk */
+	  vec_add1 (give_up, dm->unresolved_entries[i]);
+	  dns_cache_unlock (dm);
+	  continue;
+	}
+
+      /* Rotate servers so a single dead resolver does not eat every try */
+      if (ep->retry_count > 1 &&
+	  ((ep->retry_count - 1) % DNS_RETRIES_PER_SERVER) == 0)
+	{
+	  u32 n = ep->server_af ? vec_len (dm->ip6_name_servers) :
+				  vec_len (dm->ip4_name_servers);
+	  if (n > 1)
+	    ep->server_rotor = (ep->server_rotor + 1) % n;
+	}
+
       vnet_send_dns_request (vm, dm, ep);
       dns_cache_unlock (dm);
     }
+
+  for (i = 0; i < vec_len (give_up); i++)
+    {
+      dns_cache_lock (dm, 11);
+      vnet_dns_delete_entry_by_index_nolock (dm, give_up[i]);
+      dns_cache_unlock (dm);
+    }
+  vec_free (give_up);
 }
 
 static uword

@@ -19,12 +19,13 @@
 
 /* Forward declaration for internal use */
 static int dp_log_acl_enq (u32 thread_index, const dp_log_acl_event_t *ev);
+static int dp_log_dns_enq (u32 thread_index, const dp_log_dns_event_t *ev);
 
 #include <vpp/app/version.h>
 
 VLIB_PLUGIN_REGISTER () = {
   .version = VPP_BUILD_VER,
-  .description = "dp_log: dataplane ACL deny logger",
+  .description = "dp_log: dataplane ACL deny + DNS query logger",
 };
 
 DP_LOG_API int
@@ -33,8 +34,17 @@ dp_log_acl_enq_export (u32 thread_index, const dp_log_acl_event_t *ev)
   return dp_log_acl_enq (thread_index, ev);
 }
 
+DP_LOG_API int
+dp_log_dns_enq_export (u32 thread_index, const dp_log_dns_event_t *ev)
+{
+  return dp_log_dns_enq (thread_index, ev);
+}
+
 /* Exported enable flag (fast dataplane read). */
-u8 dp_log_enabled = 0;
+DP_LOG_API u8 dp_log_enabled = 0;
+
+/* Exported DNS log mode, one of DP_LOG_DNS_*. */
+DP_LOG_API u8 dp_log_dns_mode = DP_LOG_DNS_OFF;
 
 // typedef struct
 // {
@@ -68,6 +78,26 @@ typedef struct
   u64 drops;
 } dp_log_ring_t;
 
+/* Same SPSC discipline as dp_log_ring_t, carrying DNS events. Kept as a
+   separate type rather than made generic: the ring ops are inlined into the
+   dataplane enqueue path, and a generic version taking an untyped element
+   pointer plus a size would cost a multiply and lose the fixed-size copy the
+   compiler emits here. */
+typedef struct
+{
+  u32 size;
+  u32 mask;
+
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline1);
+  u32 head;
+
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline2);
+  u32 tail;
+
+  dp_log_dns_event_t *elts;
+  u64 drops;
+} dp_log_dns_ring_t;
+
 typedef struct
 {
 
@@ -83,6 +113,15 @@ typedef struct
   int fd;
   u32 n_threads;
   dp_log_ring_t *rings;
+
+  /* DNS query log: its own rings, file and ring size. The ring is far
+     smaller than the ACL one because each event carries a 256-byte name and
+     query rate is orders of magnitude below packet rate -- sizing it like
+     the ACL ring would cost hundreds of MB for no benefit. */
+  int dns_fd;
+  u8 *dns_path;
+  u32 dns_ring_size;
+  dp_log_dns_ring_t *dns_rings;
 
   pthread_t writer_thread;
   volatile int stop;
@@ -129,6 +168,40 @@ dp_log_ring_try_deq (dp_log_ring_t *r, dp_log_acl_event_t *out)
   return 1;
 }
 
+static inline uword
+dp_log_dns_ring_try_enq (dp_log_dns_ring_t *r, const dp_log_dns_event_t *ev)
+{
+  u32 head = __atomic_load_n (&r->head, __ATOMIC_RELAXED);
+  u32 tail = __atomic_load_n (&r->tail, __ATOMIC_ACQUIRE);
+  u32 next = (head + 1) & r->mask;
+
+  if (PREDICT_FALSE (next == tail))
+    {
+      __atomic_add_fetch (&r->drops, 1, __ATOMIC_RELAXED);
+      return 0;
+    }
+
+  r->elts[head] = *ev;
+
+  __atomic_store_n (&r->head, next, __ATOMIC_RELEASE);
+  return 1;
+}
+
+static inline uword
+dp_log_dns_ring_try_deq (dp_log_dns_ring_t *r, dp_log_dns_event_t *out)
+{
+  u32 tail = __atomic_load_n (&r->tail, __ATOMIC_RELAXED);
+  u32 head = __atomic_load_n (&r->head, __ATOMIC_ACQUIRE);
+
+  if (tail == head)
+    return 0;
+
+  *out = r->elts[tail];
+
+  __atomic_store_n (&r->tail, (tail + 1) & r->mask, __ATOMIC_RELEASE);
+  return 1;
+}
+
 /* ----------------------- Worker API ----------------------- */
 
 int
@@ -152,6 +225,23 @@ dp_log_acl_enq (u32 thread_index, const dp_log_acl_event_t *ev)
     }
 
   return (int) dp_log_ring_try_enq (&lm->rings[thread_index], ev);
+}
+
+static int
+dp_log_dns_enq (u32 thread_index, const dp_log_dns_event_t *ev)
+{
+  dp_log_main_t *lm = &dp_log_main;
+
+  if (PREDICT_FALSE (dp_log_dns_mode_get () == DP_LOG_DNS_OFF))
+    return 0;
+
+  if (PREDICT_FALSE (lm->dns_rings == 0))
+    return 0;
+
+  if (PREDICT_FALSE (thread_index >= lm->n_threads))
+    return 0;
+
+  return (int) dp_log_dns_ring_try_enq (&lm->dns_rings[thread_index], ev);
 }
 
 static inline void
@@ -231,6 +321,63 @@ dp_log_open_file (dp_log_main_t *lm)
     }
 
   return 0;
+}
+
+static int
+dp_log_open_dns_file (dp_log_main_t *lm)
+{
+  if (lm->dns_fd >= 0)
+    return 0;
+
+  const char *p = (const char *) lm->dns_path;
+  if (!p || !p[0])
+    return -1;
+
+  off_t file_size = 0;
+  struct stat st;
+  if (stat (p, &st) == 0)
+    file_size = st.st_size;
+
+  lm->dns_fd = open (p, O_CREAT | O_WRONLY | O_APPEND, 0644);
+  if (lm->dns_fd < 0)
+    {
+      clib_warning ("dp_log: open(%s) failed: %s", p, strerror (errno));
+      return -1;
+    }
+
+  if (file_size == 0)
+    {
+      const char *hdr = "ts,client,name,blocked,answer\n";
+      (void) write (lm->dns_fd, hdr, (int) strlen (hdr));
+    }
+
+  return 0;
+}
+
+/* Copy a DNS name into a CSV field, dropping anything that would break the
+   row or inject markup downstream. Names come off the wire, so treating
+   them as trusted text would let a crafted query forge log columns. */
+static int
+dp_log_copy_dns_name (char *dst, size_t dst_sz, const dp_log_dns_event_t *ev)
+{
+  size_t n = ev->name_len;
+  size_t o = 0;
+
+  if (dst_sz == 0)
+    return 0;
+  if (n > sizeof (ev->name))
+    n = sizeof (ev->name);
+
+  for (size_t i = 0; i < n && o + 1 < dst_sz; i++)
+    {
+      u8 c = ev->name[i];
+      /* printable ASCII only, minus the CSV metacharacters */
+      if (c < 0x20 || c > 0x7e || c == ',' || c == '"')
+	c = '_';
+      dst[o++] = (char) c;
+    }
+  dst[o] = 0;
+  return (int) o;
 }
 
 static inline int
@@ -317,12 +464,15 @@ dp_log_writer_thread_fn (void *arg)
   while (!lm->stop)
     {
       loop_count++;
-      if (!dp_log_is_enabled ())
-	{
-	  if (loop_count == 1)
-	    //   clib_warning ("dp_log: writer thread waiting for enable");
 
-	    usleep (10 * 1000);
+      /* The two logs are switched independently, so the writer runs when
+	 EITHER is on and drains only the rings that are actually enabled. */
+      int acl_on = dp_log_is_enabled ();
+      int dns_on = dp_log_dns_mode_get () != DP_LOG_DNS_OFF;
+
+      if (!acl_on && !dns_on)
+	{
+	  usleep (10 * 1000);
 	  continue;
 	}
 
@@ -331,24 +481,119 @@ dp_log_writer_thread_fn (void *arg)
       //     clib_warning ("dp_log: writer thread ENABLED (loops=%d)",
       //     loop_count);
 
-      if (lm->fd < 0)
+      if (acl_on && lm->fd < 0)
 	{
-	  //   clib_warning ("dp_log: writer thread opening file, path=%s",
-	  //   (const char *)lm->path);
 	  if (dp_log_open_file (lm) < 0)
 	    {
 	      /* If can't open, disable to avoid burning CPU */
-	      //   clib_warning ("dp_log: failed to open file (path=%s),
-	      //   disabling", (const char *)lm->path);
 	      __atomic_store_n (&dp_log_enabled, 0, __ATOMIC_RELAXED);
+	      acl_on = 0;
 	      usleep (100 * 1000);
-	      continue;
 	    }
-	  //   clib_warning ("dp_log: file opened successfully, fd=%d",
-	  //   lm->fd);
 	}
 
+      if (dns_on && lm->dns_fd < 0)
+	{
+	  if (dp_log_open_dns_file (lm) < 0)
+	    {
+	      __atomic_store_n (&dp_log_dns_mode, DP_LOG_DNS_OFF,
+				__ATOMIC_RELAXED);
+	      dns_on = 0;
+	      usleep (100 * 1000);
+	    }
+	}
+
+      if (!acl_on && !dns_on)
+	continue;
+
       int did_work = 0;
+
+      /* ---- DNS queries: written straight through, no aggregation ---- */
+      if (dns_on)
+	{
+	  char dns_out[4096];
+	  int dns_len = 0;
+
+	  for (u32 ti = 0; ti < lm->n_threads; ti++)
+	    {
+	      dp_log_dns_ring_t *r = &lm->dns_rings[ti];
+	      dp_log_dns_event_t ev;
+	      int n = 0;
+
+	      while (n < 1024 && dp_log_dns_ring_try_deq (r, &ev))
+		{
+		  did_work = 1;
+		  n++;
+
+		  char ts[32];
+		  dp_log_format_wall_time_ms (ts, sizeof (ts), lm, ev.ts_ns);
+
+		  char client[INET6_ADDRSTRLEN] = "?";
+		  char answer[INET6_ADDRSTRLEN] = "";
+		  char name[DP_LOG_DNS_NAME_MAX];
+
+		  if (!ev.is_ip6)
+		    {
+		      struct in_addr a;
+		      clib_memcpy_fast (&a, &ev.client.v4, sizeof (a));
+		      (void) inet_ntop (AF_INET, &a, client, sizeof (client));
+		    }
+		  else
+		    {
+		      struct in6_addr a6;
+		      clib_memcpy_fast (&a6, &ev.client.v6, sizeof (a6));
+		      (void) inet_ntop (AF_INET6, &a6, client, sizeof (client));
+		    }
+
+		  if (ev.has_answer)
+		    {
+		      if (!ev.answer_is_ip6)
+			{
+			  struct in_addr a;
+			  clib_memcpy_fast (&a, &ev.answer.v4, sizeof (a));
+			  (void) inet_ntop (AF_INET, &a, answer,
+					    sizeof (answer));
+			}
+		      else
+			{
+			  struct in6_addr a6;
+			  clib_memcpy_fast (&a6, &ev.answer.v6, sizeof (a6));
+			  (void) inet_ntop (AF_INET6, &a6, answer,
+					    sizeof (answer));
+			}
+		    }
+
+		  (void) dp_log_copy_dns_name (name, sizeof (name), &ev);
+
+		  char line[512];
+		  int len = snprintf (line, sizeof (line), "%s,%s,%s,%u,%s\n",
+				      ts, client, name,
+				      (unsigned) (ev.blocked ? 1 : 0), answer);
+		  if (len <= 0)
+		    continue;
+		  if (len > (int) sizeof (line) - 1)
+		    len = (int) sizeof (line) - 1;
+
+		  if (dns_len + len > (int) sizeof (dns_out))
+		    {
+		      (void) write (lm->dns_fd, dns_out, dns_len);
+		      dns_len = 0;
+		    }
+		  clib_memcpy_fast (dns_out + dns_len, line, len);
+		  dns_len += len;
+		}
+	    }
+
+	  if (dns_len > 0)
+	    (void) write (lm->dns_fd, dns_out, dns_len);
+	}
+
+      if (!acl_on)
+	{
+	  if (!did_work)
+	    usleep (10 * 1000);
+	  continue;
+	}
 
       for (u32 ti = 0; ti < lm->n_threads; ti++)
 	{
@@ -538,6 +783,15 @@ dp_log_config (vlib_main_t *vm, unformat_input_t *input)
 	{
 	  //   clib_warning ("dp_log_config: path=%s", (char *)lm->path);
 	}
+      else if (unformat (input, "dns-path %s", &lm->dns_path))
+	;
+      else if (unformat (input, "dns-ring-size %u", &lm->dns_ring_size))
+	;
+      else if (unformat (input, "dns-log-all"))
+	__atomic_store_n (&dp_log_dns_mode, DP_LOG_DNS_ALL, __ATOMIC_RELAXED);
+      else if (unformat (input, "dns-log-blocked"))
+	__atomic_store_n (&dp_log_dns_mode, DP_LOG_DNS_BLOCKED,
+			  __ATOMIC_RELAXED);
       else
 	{
 	  //   clib_warning ("dp_log_config: unknown option");
@@ -560,7 +814,14 @@ dp_log_init (vlib_main_t *vm)
   if (!lm->path)
     lm->path = format (0, "/etc/sarhad-guard/acl_logs/acl_logs.log");
 
+  lm->dns_fd = -1;
+  if (!lm->dns_path)
+    lm->dns_path = format (0, "/etc/sarhad-guard/dns_logs/dns_logs.log");
+
   lm->ring_size = dp_log_pow2_or_default (lm->ring_size, 1 << 16);
+  /* 2048 entries x ~300 bytes x n_threads. Sizing this like the ACL ring
+     (65536) would reserve hundreds of MB to buffer a few queries a second. */
+  lm->dns_ring_size = dp_log_pow2_or_default (lm->dns_ring_size, 1 << 11);
   lm->writer_core =
     (lm->writer_core == 0 && lm->writer_core == 0) ? -1 : lm->writer_core;
   /* (above line effectively keeps default -1 if not set; harmless) */
@@ -600,6 +861,25 @@ dp_log_init (vlib_main_t *vm)
       r->elts = clib_mem_alloc_aligned (r->size * sizeof (dp_log_acl_event_t),
 					CLIB_CACHE_LINE_BYTES);
       clib_memset (r->elts, 0, r->size * sizeof (dp_log_acl_event_t));
+
+      __atomic_store_n (&r->head, 0, __ATOMIC_RELAXED);
+      __atomic_store_n (&r->tail, 0, __ATOMIC_RELAXED);
+      __atomic_store_n (&r->drops, 0, __ATOMIC_RELAXED);
+    }
+
+  lm->dns_rings = clib_mem_alloc_aligned (
+    sizeof (*lm->dns_rings) * lm->n_threads, CLIB_CACHE_LINE_BYTES);
+  clib_memset (lm->dns_rings, 0, sizeof (*lm->dns_rings) * lm->n_threads);
+
+  for (u32 i = 0; i < lm->n_threads; i++)
+    {
+      dp_log_dns_ring_t *r = &lm->dns_rings[i];
+      r->size = lm->dns_ring_size;
+      r->mask = r->size - 1;
+
+      r->elts = clib_mem_alloc_aligned (
+	r->size * sizeof (dp_log_dns_event_t), CLIB_CACHE_LINE_BYTES);
+      clib_memset (r->elts, 0, r->size * sizeof (dp_log_dns_event_t));
 
       __atomic_store_n (&r->head, 0, __ATOMIC_RELAXED);
       __atomic_store_n (&r->tail, 0, __ATOMIC_RELAXED);

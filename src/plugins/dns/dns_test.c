@@ -250,6 +250,153 @@ api_dns_name_server_add_del (vat_main_t * vam)
   return ret;
 }
 
+static int
+api_dns_cache_add_del (vat_main_t * vam)
+{
+  unformat_input_t *line_input = vam->input;
+  vl_api_dns_cache_add_del_t *mp;
+  ip4_address_t a4;
+  ip6_address_t a6;
+  int a4_set = 0;
+  int a6_set = 0;
+  u8 *name = 0;
+  u8 is_add = 1;
+  int ret;
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "del"))
+	is_add = 0;
+      else if (unformat (line_input, "add"))
+	is_add = 1;
+      else if (unformat (line_input, "%U", unformat_ip4_address, &a4))
+	a4_set = 1;
+      else if (unformat (line_input, "%U", unformat_ip6_address, &a6))
+	a6_set = 1;
+      else if (unformat (line_input, "%s", &name))
+	;
+      else
+	break;
+    }
+
+  if (name == 0)
+    {
+      errmsg ("missing name");
+      return -99;
+    }
+
+  if (vec_len (name) > 255)
+    {
+      errmsg ("name too long");
+      vec_free (name);
+      return -99;
+    }
+
+  if (is_add && !(a4_set + a6_set))
+    {
+      errmsg ("missing address to map the name to");
+      vec_free (name);
+      return -99;
+    }
+
+  /* Construct the API message */
+  M (DNS_CACHE_ADD_DEL, mp);
+  memcpy (mp->name, name, vec_len (name));
+  vec_free (name);
+  mp->is_add = is_add;
+  if (a4_set)
+    {
+      mp->ip4_set = 1;
+      clib_memcpy (mp->ip4_address, &a4, sizeof (a4));
+    }
+  if (a6_set)
+    {
+      mp->ip6_set = 1;
+      clib_memcpy (mp->ip6_address, &a6, sizeof (a6));
+    }
+
+  /* send it... */
+  S (mp);
+
+  /* Wait for a reply, return good/bad news  */
+  W (ret);
+  return ret;
+}
+
+static int
+api_dns_cache_clear (vat_main_t * vam)
+{
+  vl_api_dns_cache_clear_t *mp;
+  int ret;
+
+  /* Construct the API message */
+  M (DNS_CACHE_CLEAR, mp);
+
+  /* send it... */
+  S (mp);
+
+  /* Wait for a reply, return good/bad news  */
+  W (ret);
+  return ret;
+}
+
+static int
+api_dns_block_redirect_add_del (vat_main_t * vam)
+{
+  unformat_input_t *line_input = vam->input;
+  vl_api_dns_block_redirect_add_del_t *mp;
+  ip4_address_t prefix = { 0 }, address = { 0 };
+  u32 prefix_len = 0;
+  u8 is_add = 1;
+  u8 flush = 0;
+  int prefix_set = 0, address_set = 0;
+  int ret;
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "flush"))
+	flush = 1;
+      else if (unformat (line_input, "del"))
+	is_add = 0;
+      else if (unformat (line_input, "add"))
+	is_add = 1;
+      else if (unformat (line_input, "%U/%d", unformat_ip4_address, &prefix,
+			 &prefix_len))
+	prefix_set = 1;
+      else if (unformat (line_input, "%U", unformat_ip4_address, &address))
+	address_set = 1;
+      else
+	break;
+    }
+
+  if (!flush && !prefix_set)
+    {
+      errmsg ("missing client prefix");
+      return -99;
+    }
+  if (!flush && is_add && !address_set)
+    {
+      errmsg ("missing block page address");
+      return -99;
+    }
+  if (prefix_len > 32)
+    {
+      errmsg ("prefix length must be 0..32");
+      return -99;
+    }
+
+  M (DNS_BLOCK_REDIRECT_ADD_DEL, mp);
+  mp->is_add = is_add;
+  mp->flush = flush;
+  mp->prefix_len = (u8) prefix_len;
+  clib_memcpy (mp->prefix, &prefix, sizeof (prefix));
+  clib_memcpy (mp->address, &address, sizeof (address));
+
+  S (mp);
+  W (ret);
+  return ret;
+}
+
 #include <dns/dns.api_test.c>
 
 /*

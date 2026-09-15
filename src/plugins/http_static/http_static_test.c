@@ -241,6 +241,97 @@ api_http_static_enable_v5 (vat_main_t *vam)
   return ret;
 }
 
+static int
+api_http_static_listener_add_del (vat_main_t *vam)
+{
+  unformat_input_t *line_input = vam->input;
+  vl_api_http_static_listener_add_del_t *mp;
+  u8 *www_root = 0;
+  u8 *uri = 0;
+  u32 ckpair_index = ~0;
+  u32 cache_size_limit = 1 << 20;
+  u32 max_age = HSS_DEFAULT_MAX_AGE;
+  u32 keepalive_timeout = HSS_DEFAULT_KEEPALIVE_TIMEOUT;
+  u64 max_body_size = HSS_DEFAULT_MAX_BODY_SIZE;
+  u32 rx_buff_thresh = HSS_DEFAULT_RX_BUFFER_THRESH;
+  u8 is_add = 1;
+  u8 catch_all = 0;
+  u8 http1_only = 0;
+  int ret;
+
+  /* Parse args required to build the message */
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "add"))
+	is_add = 1;
+      else if (unformat (line_input, "del"))
+	is_add = 0;
+      else if (unformat (line_input, "www-root %s", &www_root))
+	;
+      else if (unformat (line_input, "uri %s", &uri))
+	;
+      else if (unformat (line_input, "ckpair %d", &ckpair_index))
+	;
+      else if (unformat (line_input, "catch-all"))
+	catch_all = 1;
+      else if (unformat (line_input, "http1-only"))
+	http1_only = 1;
+      else if (unformat (line_input, "cache-size %U", unformat_memory_size,
+			 &cache_size_limit))
+	;
+      else if (unformat (line_input, "max-age %d", &max_age))
+	;
+      else if (unformat (line_input, "keepalive-timeout %d",
+			 &keepalive_timeout))
+	;
+      else if (unformat (line_input, "max-req-body-size %U",
+			 unformat_memory_size, &max_body_size))
+	;
+      else if (unformat (line_input, "rx-buff-thresh %U", unformat_memory_size,
+			 &rx_buff_thresh))
+	;
+      else
+	{
+	  errmsg ("unknown input `%U'", format_unformat_error, line_input);
+	  return -99;
+	}
+    }
+
+  if (uri == 0)
+    {
+      errmsg ("Must specify uri");
+      return -99;
+    }
+
+  if (is_add && www_root == 0)
+    {
+      errmsg ("Must specify www-root");
+      return -99;
+    }
+
+  /* Construct the API message */
+  M (HTTP_STATIC_LISTENER_ADD_DEL, mp);
+  strncpy_s ((char *) mp->uri, 256, (const char *) uri, 256);
+  if (www_root)
+    strncpy_s ((char *) mp->www_root, 256, (const char *) www_root, 256);
+  mp->is_add = is_add;
+  mp->catch_all = catch_all;
+  mp->http1_only = http1_only;
+  mp->ckpair_index = ntohl (ckpair_index);
+  mp->cache_size_limit = ntohl (cache_size_limit);
+  mp->max_age = ntohl (max_age);
+  mp->keepalive_timeout = ntohl (keepalive_timeout);
+  mp->max_body_size = clib_host_to_net_u64 (max_body_size);
+  mp->rx_buff_thresh = ntohl (rx_buff_thresh);
+
+  /* send it... */
+  S (mp);
+
+  /* Wait for a reply... */
+  W (ret);
+  return ret;
+}
+
 #include <http_static/http_static.api_test.c>
 
 /*

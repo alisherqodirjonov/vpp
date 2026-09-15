@@ -3,7 +3,7 @@
     This file defines static http server control-plane API messages
 */
 
-option version = "2.5.0";
+option version = "2.6.0";
 
 /** \brief Configure and enable the static http server
     @param client_index - opaque cookie to identify the sender
@@ -79,5 +79,50 @@ autoreply define http_static_enable_v5 {
     /* Root of the html path */
     string www_root[256];
     /* The bind URI */
+    string uri[256];
+};
+
+/** \brief Add or delete an http static server listener
+
+    The server must already be enabled (http_static_enable_v5). Use this to
+    add extra listeners, e.g. a plaintext one on :80 and a TLS one on :443
+    serving the same document root.
+
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param is_add - add = 1, delete = 0
+    @param catch_all - serve www_root/index.html for every request target,
+                       rather than 404'ing unknown paths. Intended for
+                       block/captive pages, where the client asks for
+                       whatever path it originally wanted.
+    @param http1_only - restrict ALPN to http/1.1
+    @param ckpair_index - cert/key pair to use for a tls:// uri, as returned
+                          by app_add_cert_key_pair. ~0 selects the built-in
+                          self-signed test certificate.
+    @param cache_size_limit - size (in bytes) of the in-memory file data cache
+    @param max_age - how long a response is considered fresh (in seconds)
+    @param keepalive_timeout - timeout during which client connection will
+                               stay open (in seconds)
+    @param max_body_size - maximum size of a request body (in bytes)
+    @param rx_buff_thresh - maximum size of a large memory allocation (bytes)
+    @param www_root - html root path
+    @param uri - bind URI, e.g. "tcp://0.0.0.0/80" or "tls://0.0.0.0/443"
+*/
+autoreply define http_static_listener_add_del {
+    u32 client_index;
+    u32 context;
+
+    u8 is_add [default=1];
+    u8 catch_all;
+    u8 http1_only;
+
+    u32 ckpair_index [default=0xffffffff];
+    u32 cache_size_limit;
+    u32 max_age [default=600];
+    u32 keepalive_timeout [default=60];
+    u64 max_body_size [default=8192];
+    u32 rx_buff_thresh [default=1048576];
+
+    string www_root[256];
     string uri[256];
 };

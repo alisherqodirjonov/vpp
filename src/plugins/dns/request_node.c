@@ -248,6 +248,14 @@ dns46_request_inline (vlib_main_t * vm,
 	  c_name0 = vec_dup (name0);
 	  vec_add1 (c_name0, 0);
 	  vnet_dns_resolve_name (vm, dm, c_name0, t0, &ep0);
+
+	  /* Log only what we actually answered here. A pending resolution is
+	     logged by the resolver process once the upstream reply lands, so
+	     each query produces exactly one row. */
+	  if (ep0)
+	    dns_log_query (vm->thread_index, c_name0, is_ip6, t0->dst_address,
+			   ep0);
+
 	  vec_free (c_name0);
 
 	  if (ep0)

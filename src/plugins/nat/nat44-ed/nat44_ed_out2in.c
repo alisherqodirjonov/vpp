@@ -253,7 +253,8 @@ icmp_out2in_ed_slow_path (snat_main_t *sm, vlib_buffer_t *b, ip4_header_t *ip,
     {
       /* Accounting */
       nat44_session_update_counters (
-	s, now, vlib_buffer_length_in_chain (vm, b), thread_index);
+	s, now, vlib_buffer_length_in_chain (vm, b), thread_index,
+				     NAT44_ED_DIR_O2I);
       /* Per-user LRU list maintenance */
       nat44_session_update_lru (sm, s, thread_index);
     }
@@ -655,7 +656,8 @@ create_bypass_for_fwd (snat_main_t *sm, vlib_buffer_t *b, snat_session_t *s,
     }
 
   /* Accounting */
-  nat44_session_update_counters (s, now, 0, thread_index);
+  nat44_session_update_counters (s, now, 0, thread_index,
+				     NAT44_ED_DIR_O2I);
   /* Per-user LRU list maintenance */
   nat44_session_update_lru (sm, s, thread_index);
 }
@@ -727,7 +729,8 @@ nat44_ed_out2in_slowpath_unknown_proto (snat_main_t *sm, vlib_buffer_t *b,
 
   /* Accounting */
   nat44_session_update_counters (s, now, vlib_buffer_length_in_chain (vm, b),
-				 thread_index);
+				 thread_index,
+				     NAT44_ED_DIR_O2I);
   /* Per-user LRU list maintenance */
   nat44_session_update_lru (sm, s, thread_index);
 
@@ -989,7 +992,8 @@ nat44_ed_out2in_fast_path_node_fn_inline (vlib_main_t * vm,
       /* Accounting */
       nat44_session_update_counters (s0, now,
 				     vlib_buffer_length_in_chain (vm, b0),
-				     thread_index);
+				     thread_index,
+				     NAT44_ED_DIR_O2I);
       /* Per-user LRU list maintenance */
       nat44_session_update_lru (sm, s0, thread_index);
 
@@ -1257,7 +1261,8 @@ nat44_ed_out2in_slow_path_node_fn_inline (vlib_main_t * vm,
       /* Accounting */
       nat44_session_update_counters (s0, now,
 				     vlib_buffer_length_in_chain (vm, b0),
-				     thread_index);
+				     thread_index,
+				     NAT44_ED_DIR_O2I);
       /* Per-user LRU list maintenance */
       nat44_session_update_lru (sm, s0, thread_index);
 

@@ -182,6 +182,21 @@ hss_cache_detach_entry (hss_cache_t *hc, u32 ce_index)
 
   hss_cache_lock (hc);
 
+  /*
+   * The session recorded ce_index against the cache of the listener it was
+   * accepted on. A listener that is deleted and re-added -- which is what
+   * re-applying the DNS block page does -- can hand its index back out to a
+   * new listener with an empty cache, and sessions still draining from the
+   * old one then arrive here with an index this pool never had. Without the
+   * check, pool_elt_at_index () on an empty pool yields a bogus pointer and
+   * the refcount decrement is a SIGSEGV on the session-input worker.
+   */
+  if (PREDICT_FALSE (pool_is_free_index (hc->cache_pool, ce_index)))
+    {
+      hss_cache_unlock (hc);
+      return;
+    }
+
   ce = pool_elt_at_index (hc->cache_pool, ce_index);
   ce->inuse--;
 

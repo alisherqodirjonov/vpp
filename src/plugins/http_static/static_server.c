@@ -516,6 +516,23 @@ try_file_handler (hss_session_t *hs)
   sanitized_path = http_path_sanitize (hs->target_path);
 
   /*
+   * Catch-all listener: answer every request target with index.html,
+   * whatever was asked for. This is what makes a block page work -- the
+   * client was steered here by a DNS answer and still asks for whatever
+   * path it originally wanted, so 404'ing those defeats the purpose.
+   *
+   * Substituting the path here rather than at the format () below matters:
+   * sanitized_path is also what content_type_from_request () reads, so
+   * leaving the original in place would label the page text/css for a
+   * client that happened to ask for a stylesheet.
+   */
+  if (l->flags & HSS_LISTENER_F_CATCH_ALL)
+    {
+      vec_free (sanitized_path);
+      sanitized_path = format (0, "index.html%c", 0);
+    }
+
+  /*
    * Construct the file to open
    */
   if (!sanitized_path)
@@ -964,6 +981,7 @@ hss_listen (hss_listener_t *l, session_handle_t *lh)
 {
   hss_main_t *hsm = &hss_main;
   vnet_listen_args_t _a, *a = &_a;
+  session_endpoint_cfg_t sep;
   u8 need_crypto;
   transport_endpt_ext_cfg_t *ext_cfg;
   int rv;
@@ -974,8 +992,17 @@ hss_listen (hss_listener_t *l, session_handle_t *lh)
 
   need_crypto = hss_transport_needs_crypto (l->sep.transport_proto);
 
-  l->sep.transport_proto = TRANSPORT_PROTO_HTTP;
-  clib_memcpy (&a->sep_ext, &l->sep, sizeof (l->sep));
+  /*
+   * Listen on a COPY of the endpoint. Rewriting the caller's
+   * sep.transport_proto to HTTP here is what made reconfiguration
+   * impossible: hss_listener_add () stores the rewritten endpoint, so a
+   * later "del" built by re-parsing the very same uri (transport_proto
+   * still TCP/TLS) never compared equal, the stale listener survived, and
+   * the re-add came back as "ip port pair already listened on".
+   */
+  sep = l->sep;
+  sep.transport_proto = TRANSPORT_PROTO_HTTP;
+  clib_memcpy (&a->sep_ext, &sep, sizeof (sep));
 
   ext_cfg = session_endpoint_add_ext_cfg (
     &a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
@@ -987,7 +1014,11 @@ hss_listen (hss_listener_t *l, session_handle_t *lh)
       ext_cfg = session_endpoint_add_ext_cfg (
 	&a->sep_ext, TRANSPORT_ENDPT_EXT_CFG_CRYPTO,
 	sizeof (transport_endpt_crypto_cfg_t));
-      ext_cfg->crypto.ckpair_index = hsm->ckpair_index;
+      /* A listener may carry its own cert/key pair (added over the binary
+	 API with app_add_cert_key_pair). Fall back to the built-in
+	 self-signed test cert only when none was configured. */
+      ext_cfg->crypto.ckpair_index =
+	(l->ckpair_index != (u32) ~0) ? l->ckpair_index : hsm->ckpair_index;
       if (l->flags & HSS_LISTENER_F_HTTP1_ONLY)
 	ext_cfg->crypto.alpn_protos[0] = TLS_ALPN_PROTO_HTTP_1_1;
     }
@@ -1019,11 +1050,19 @@ hss_listener_add (hss_listener_t *l_cfg)
   app_listener_t *al;
   hss_listener_t *l;
   session_t *ls;
+  int rv;
 
-  if (hss_listen (l_cfg, &lh))
+  if ((rv = hss_listen (l_cfg, &lh)))
     {
-      clib_warning ("failed to start listening");
-      return -1;
+      /* Report what the session layer actually objected to. "failed to start
+	 listening" alone is unactionable -- the usual causes (the address is
+	 not configured on any interface, the port is already bound) are
+	 indistinguishable without the code. */
+      clib_warning ("failed to listen on %U:%d: %U", format_ip46_address,
+		    &l_cfg->sep.ip, l_cfg->sep.is_ip4,
+		    clib_net_to_host_u16 (l_cfg->sep.port),
+		    format_session_error, rv);
+      return rv;
     }
 
   pool_get (hsm->listeners, l);
@@ -1054,7 +1093,14 @@ hss_listener_del (hss_listener_t *l_cfg)
 
   pool_foreach (l, hsm->listeners)
     {
-      if (clib_memcmp (&l_cfg->sep, &l->sep, sizeof (l_cfg->sep)) == 0)
+      /* Compare the fields that identify a bind. A raw memcmp of the whole
+	 session endpoint also compares struct padding and fields nobody set
+	 identically on both paths, so it matched far less often than it
+	 looked like it would. */
+      if (l->sep.is_ip4 == l_cfg->sep.is_ip4 &&
+	  l->sep.port == l_cfg->sep.port &&
+	  l->sep.transport_proto == l_cfg->sep.transport_proto &&
+	  ip46_address_is_equal (&l->sep.ip, &l_cfg->sep.ip))
 	{
 	  found = 1;
 	  break;
@@ -1131,6 +1177,7 @@ hss_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
   l->max_req_body_size = HSS_DEFAULT_MAX_BODY_SIZE;
   l->rx_buff_thresh = HSS_DEFAULT_RX_BUFFER_THRESH;
   l->keepalive_timeout = HSS_DEFAULT_KEEPALIVE_TIMEOUT;
+  l->ckpair_index = ~0;
   l->flags = 0;
 
   /* Get a line of input. */
@@ -1179,6 +1226,10 @@ hss_create_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (line_input, "http1-only"))
 	l->flags |= HSS_LISTENER_F_HTTP1_ONLY;
+      else if (unformat (line_input, "catch-all"))
+	l->flags |= HSS_LISTENER_F_CATCH_ALL;
+      else if (unformat (line_input, "ckpair %d", &l->ckpair_index))
+	;
       /* Deprecated */
       else if (unformat (line_input, "max-body-size %U", unformat_memory_size,
 			 &l->max_req_body_size))
@@ -1253,7 +1304,7 @@ VLIB_CLI_COMMAND (hss_create_command, static) = {
     "[prealloc-fifos <nn>] [debug <nn>] [uri <uri>] [www-root <path>]\n"
     "[url-handlers] [cache-size <nn>] [max-age <nseconds>]\n"
     "[max-req-body-size <nn>] [rx-buff-thresh <nn>] [keepalive-timeout <nn>]\n"
-    "[ptr-thresh <nn>] [http1-only]\n",
+    "[ptr-thresh <nn>] [http1-only] [catch-all] [ckpair <nn>]\n",
   .function = hss_create_command_fn,
 };
 
@@ -1279,6 +1330,7 @@ hss_add_del_listener_command_fn (vlib_main_t *vm, unformat_input_t *input,
   l->max_req_body_size = HSS_DEFAULT_MAX_BODY_SIZE;
   l->rx_buff_thresh = HSS_DEFAULT_RX_BUFFER_THRESH;
   l->keepalive_timeout = HSS_DEFAULT_KEEPALIVE_TIMEOUT;
+  l->ckpair_index = ~0;
   l->flags = 0;
 
   while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
@@ -1312,6 +1364,10 @@ hss_add_del_listener_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	;
       else if (unformat (line_input, "http1-only"))
 	l->flags |= HSS_LISTENER_F_HTTP1_ONLY;
+      else if (unformat (line_input, "catch-all"))
+	l->flags |= HSS_LISTENER_F_CATCH_ALL;
+      else if (unformat (line_input, "ckpair %d", &l->ckpair_index))
+	;
       /* Deprecated */
       else if (unformat (line_input, "max-body-size %U", unformat_memory_size,
 			 &l->max_req_body_size))
@@ -1388,7 +1444,7 @@ VLIB_CLI_COMMAND (hss_add_del_listener_command, static) = {
     "http static listener [add|del] [uri <uri>] [www-root <path>]\n"
     "[url-handlers] [cache-size <nn>] [max-age <nseconds>]\n"
     "[max-req-body-size <nn>] [rx-buff-thresh <nn>] [keepalive-timeout <nn>]\n"
-    "[ptr-thresh <nn>] [http1-only]\n",
+    "[ptr-thresh <nn>] [http1-only] [catch-all] [ckpair <nn>]\n",
   .function = hss_add_del_listener_command_fn,
 };
 

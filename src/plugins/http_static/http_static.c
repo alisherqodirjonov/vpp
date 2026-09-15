@@ -75,18 +75,35 @@ hss_enable_api (u32 fifo_size, u32 cache_limit, u32 prealloc_fifos,
   hsm->fifo_size = fifo_size;
   hsm->prealloc_fifos = prealloc_fifos;
   hsm->private_segment_size = private_segment_size;
-  if (uri && parse_uri ((char *) uri, &hsm->default_listener.sep))
-    return VNET_API_ERROR_INVALID_VALUE;
   hsm->default_listener.www_root = format (0, "%s%c", www_root, 0);
   hsm->default_listener.cache_size = cache_limit;
   hsm->default_listener.max_age = max_age;
   hsm->default_listener.max_req_body_size = max_body_size;
   hsm->default_listener.rx_buff_thresh = rx_buff_thresh;
   hsm->default_listener.keepalive_timeout = keepalive_timeout;
-  hsm->have_default_listener = 1;
+  hsm->default_listener.ckpair_index = ~0;
 
-  if (vec_len (hsm->default_listener.www_root) < 2)
-    return VNET_API_ERROR_INVALID_VALUE;
+  /*
+   * uri is a fixed-size field in the message, so the pointer is never NULL
+   * -- test the string, not the pointer, or an unset uri lands in parse_uri
+   * ("") and the whole enable fails with INVALID_VALUE.
+   *
+   * An empty uri now means "bring the server up with no listener of its
+   * own", which is what the CLI has always done and what a caller that adds
+   * its own listeners afterwards (http_static_listener_add_del) wants: it
+   * shouldn't have to invent a throwaway bind address to get the
+   * application attached.
+   */
+  if (uri && uri[0])
+    {
+      if (parse_uri ((char *) uri, &hsm->default_listener.sep))
+	return VNET_API_ERROR_INVALID_VALUE;
+      hsm->have_default_listener = 1;
+
+      /* Only the default listener needs a document root */
+      if (vec_len (hsm->default_listener.www_root) < 2)
+	return VNET_API_ERROR_INVALID_VALUE;
+    }
 
   if (hsm->app_index != ~0)
     return VNET_API_ERROR_APP_ALREADY_ATTACHED;
@@ -146,6 +163,82 @@ vl_api_http_static_enable_v5_t_handler (vl_api_http_static_enable_v5_t *mp)
 		       ntohl (mp->max_body_size), ntohl (mp->rx_buff_thresh));
 
   REPLY_MACRO (VL_API_HTTP_STATIC_ENABLE_V5_REPLY);
+}
+
+/* API message handler */
+static void
+vl_api_http_static_listener_add_del_t_handler (
+  vl_api_http_static_listener_add_del_t *mp)
+{
+  vl_api_http_static_listener_add_del_reply_t *rmp;
+  hss_main_t *hsm = &hss_main;
+  hss_listener_t _l = {}, *l = &_l;
+  int rv = 0;
+
+  /* Listeners are attached to the server's application, so it has to
+     exist first: http_static_enable_v5 before any of these. */
+  if (!hsm->is_init)
+    {
+      rv = VNET_API_ERROR_FEATURE_DISABLED;
+      goto done;
+    }
+
+  mp->uri[ARRAY_LEN (mp->uri) - 1] = 0;
+  mp->www_root[ARRAY_LEN (mp->www_root) - 1] = 0;
+
+  if (mp->uri[0] == 0)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+
+  if (parse_uri ((char *) mp->uri, &l->sep))
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+
+  if (mp->is_add == 0)
+    {
+      /* Matched on the session endpoint alone; nothing else is read */
+      rv = hss_listener_del (l) ? VNET_API_ERROR_NO_SUCH_ENTRY : 0;
+      goto done;
+    }
+
+  l->www_root = format (0, "%s%c", mp->www_root, 0);
+  if (vec_len (l->www_root) < 2)
+    {
+      vec_free (l->www_root);
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+
+  l->ckpair_index = ntohl (mp->ckpair_index);
+  l->cache_size = ntohl (mp->cache_size_limit);
+  l->max_age = ntohl (mp->max_age);
+  l->keepalive_timeout = ntohl (mp->keepalive_timeout);
+  l->max_req_body_size = clib_net_to_host_u64 (mp->max_body_size);
+  l->rx_buff_thresh = ntohl (mp->rx_buff_thresh);
+  if (mp->http1_only)
+    l->flags |= HSS_LISTENER_F_HTTP1_ONLY;
+  if (mp->catch_all)
+    l->flags |= HSS_LISTENER_F_CATCH_ALL;
+
+  if (l->cache_size < (128 << 10))
+    {
+      vec_free (l->www_root);
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+
+  if (hss_listener_add (l))
+    {
+      vec_free (l->www_root);
+      rv = VNET_API_ERROR_INIT_FAILED;
+    }
+
+done:
+  REPLY_MACRO (VL_API_HTTP_STATIC_LISTENER_ADD_DEL_REPLY);
 }
 
 #include <http_static/http_static.api.c>

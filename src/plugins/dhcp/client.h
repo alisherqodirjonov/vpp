@@ -70,6 +70,16 @@ typedef struct dhcp_client_t_
   /* State machine retry counter */
   u32 retry_count;
 
+  /**
+   * ARP announcements still owed for the leased address.
+   * RFC 5227 3: a host that has acquired an address broadcasts several
+   * announcements a couple of seconds apart, because one can be lost
+   * while the link or the upstream switch is still settling -- and a
+   * neighbour that missed it keeps sending our traffic to whoever held
+   * the address before us.
+   */
+  u32 announce_left;
+
   /* Send next pkt at this time */
   f64 next_transmit;
   f64 lease_expires;
