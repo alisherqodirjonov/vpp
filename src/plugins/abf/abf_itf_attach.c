@@ -172,7 +172,16 @@ abf_itf_attach (fib_protocol_t fproto,
 
   api = abf_policy_find (policy_id);
 
-  ASSERT (INDEX_INVALID != api);
+  /*
+   * The policy must exist. This used to be an ASSERT, which is compiled out of
+   * release builds, so an attach naming an unknown policy id fell straight into
+   * abf_policy_get() -> pool_elt_at_index(pool, ~0) and segfaulted the whole
+   * data plane from a single API call. The CLI path already rejects this with
+   * "invalid policy ID"; the binary API must do the same.
+   */
+  if (INDEX_INVALID == api)
+    return (VNET_API_ERROR_INVALID_VALUE);
+
   ap = abf_policy_get (api);
 
   /*

@@ -136,6 +136,16 @@ abf_policy_update (u32 policy_id,
 
       if (FIB_NODE_INDEX_INVALID != old_pl)
 	{
+	  /*
+	   * Hold old_pl across the swap. For a SHARED list,
+	   * copy_and_path_add returns the EXISTING list when the result is
+	   * identical (e.g. re-adding a path the policy already has), so
+	   * ap_pl == old_pl and the child_remove below would drop the last
+	   * reference and free the list we still point at; the next
+	   * abf_policy_dump then walks freed memory. abf_policy_delete
+	   * already brackets its swap with this lock.
+	   */
+	  fib_path_list_lock (old_pl);
 	  ap->ap_pl = fib_path_list_copy_and_path_add (old_pl,
 						       (FIB_PATH_LIST_FLAG_SHARED
 							|
@@ -153,6 +163,9 @@ abf_policy_update (u32 policy_id,
       ap->ap_sibling = fib_path_list_child_add (ap->ap_pl,
 						abf_policy_fib_node_type,
 						api);
+
+      if (FIB_NODE_INDEX_INVALID != old_pl)
+	fib_path_list_unlock (old_pl);
 
       fib_node_back_walk_ctx_t ctx = {
 	.fnbw_reason = FIB_NODE_BW_REASON_FLAG_EVALUATE,

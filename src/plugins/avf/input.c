@@ -530,7 +530,7 @@ no_more_desc:
 
   vlib_increment_combined_counter (vnm->interface_main.combined_sw_if_counters
 				   + VNET_INTERFACE_COUNTER_RX, thr_idx,
-				   ad->hw_if_index, n_rx_packets, n_rx_bytes);
+				   ad->sw_if_index, n_rx_packets, n_rx_bytes);
 
 done:
   /* refill rx ring */

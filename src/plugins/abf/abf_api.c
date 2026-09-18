@@ -161,7 +161,16 @@ abf_policy_send_details (u32 api, void *args)
   mp->policy.acl_index = htonl (ap->ap_acl);
   mp->policy.policy_id = htonl (ap->ap_id);
 
-  fib_path_list_walk_w_ext (ap->ap_pl, NULL, fib_path_encode, &walk_ctx);
+  /*
+   * A policy whose last path was removed keeps ap_pl == FIB_NODE_INDEX_INVALID
+   * until the policy object itself is freed, and it stays visible to this dump
+   * while an attachment still holds a lock on it. fib_path_list_get_n_paths()
+   * above returns 0 for INVALID, but the walk passes the index straight to
+   * pool_elt_at_index(), so dumping such a policy reads far outside the pool
+   * and segfaults. format_abf() guards the same way before formatting ap_pl.
+   */
+  if (FIB_NODE_INDEX_INVALID != ap->ap_pl)
+    fib_path_list_walk_w_ext (ap->ap_pl, NULL, fib_path_encode, &walk_ctx);
 
   fp = mp->policy.paths;
   vec_foreach (rpath, walk_ctx.rpaths)
