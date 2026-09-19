@@ -17,6 +17,7 @@
 #include <dhcp/client.h>
 #include <dhcp/dhcp_proxy.h>
 #include <vnet/fib/fib_table.h>
+#include <vnet/ip-neighbor/ip4_neighbor.h>
 #include <vnet/qos/qos_types.h>
 
 vlib_log_class_t dhcp_logger;
@@ -127,6 +128,13 @@ format_dhcp_client (u8 * s, va_list * va)
   return s;
 }
 
+/** RFC 5227 3 ANNOUNCE_NUM / ANNOUNCE_INTERVAL. */
+#define DHCP_ARP_ANNOUNCE_COUNT 3
+#define DHCP_ARP_ANNOUNCE_INTERVAL 2.0
+
+static void dhcp_client_announce_address (dhcp_client_main_t * dcm,
+					  dhcp_client_t * c);
+
 static void
 dhcp_client_acquire_address (dhcp_client_main_t * dcm, dhcp_client_t * c)
 {
@@ -164,6 +172,41 @@ dhcp_client_acquire_address (dhcp_client_main_t * dcm, dhcp_client_t * c)
     }
   clib_memcpy (&c->installed, &c->learned, sizeof (c->installed));
   c->addresses_installed = 1;
+
+  /*
+   * Announce the address (RFC 2131 4.4.1: the client SHOULD ARP for it).
+   *
+   * Without this, VPP never tells the segment which MAC now owns the leased
+   * address. A neighbour that cached a stale entry -- an upstream router
+   * still holding the previous tenant of this address, say -- keeps sending
+   * our traffic to a MAC that is no longer there, and ethernet-input drops
+   * every frame as "l3 mac mismatch". Nothing on this box can see why: the
+   * queries leave, the FIB and ARP are right, and the answers simply never
+   * arrive. Routers commonly do not refresh from data-plane frames, so the
+   * entry stays wrong until it ages out, or forever.
+   *
+   * Queue several: one announcement sent the instant the lease lands can be
+   * lost while the link or the upstream switch is still settling, and a
+   * neighbour that missed it never learns. dhcp_client_sm () drains this.
+   */
+  c->announce_left = DHCP_ARP_ANNOUNCE_COUNT;
+  dhcp_client_announce_address (dcm, c);
+}
+
+/**
+ * Broadcast one gratuitous ARP for the leased address and count it off.
+ */
+static void
+dhcp_client_announce_address (dhcp_client_main_t * dcm, dhcp_client_t * c)
+{
+  if (0 == c->installed.leased_address.as_u32)
+    return;
+
+  ip4_neighbor_advertise (dcm->vlib_main, dcm->vnet_main, c->sw_if_index,
+			  vlib_get_thread_index (),
+			  &c->installed.leased_address);
+  if (c->announce_left)
+    c->announce_left--;
 }
 
 static void
@@ -782,6 +825,20 @@ dhcp_bound_state (dhcp_client_main_t * dcm, dhcp_client_t * c, f64 now)
        * since the objects to do so have been lost */
       dhcp_client_reset (dcm, c);
       return 1;
+    }
+
+  /*
+   * Still owe the segment an ARP announcement or two for this address. Space
+   * them out (RFC 5227 uses 2s) rather than blasting them together, so a
+   * neighbour that was not listening for the first one still catches a later
+   * one. This runs before the renewal below because it is time-critical: until
+   * a neighbour has our MAC, nothing addressed to us arrives.
+   */
+  if (c->announce_left)
+    {
+      dhcp_client_announce_address (dcm, c);
+      c->next_transmit = now + DHCP_ARP_ANNOUNCE_INTERVAL;
+      return 0;
     }
 
   DHCP_INFO ("enter bound: %U", format_dhcp_client, dcm, c, 1 /* verbose */ );

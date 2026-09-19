@@ -173,14 +173,15 @@ abf_itf_attach (fib_protocol_t fproto,
   api = abf_policy_find (policy_id);
 
   /*
-   * The policy must exist. This used to be an ASSERT, which is compiled out of
-   * release builds, so an attach naming an unknown policy id fell straight into
-   * abf_policy_get() -> pool_elt_at_index(pool, ~0) and segfaulted the whole
-   * data plane from a single API call. The CLI path already rejects this with
-   * "invalid policy ID"; the binary API must do the same.
+   * Attaching a policy that does not exist is a caller error, but the ASSERT
+   * that used to be the only thing standing here is compiled out in a release
+   * build -- abf_policy_get (INDEX_INVALID) then indexes the policy pool out
+   * of bounds and the attachment is built around whatever it finds. A restore
+   * hits this whenever a policy failed to create (a missing ACL, say) and the
+   * attachment for it is replayed anyway.
    */
   if (INDEX_INVALID == api)
-    return (VNET_API_ERROR_INVALID_VALUE);
+    return (VNET_API_ERROR_NO_SUCH_ENTRY);
 
   ap = abf_policy_get (api);
 
@@ -214,6 +215,20 @@ abf_itf_attach (fib_protocol_t fproto,
   /*
    * Insert the policy on the interfaces list.
    */
+  /*
+   * The per-interface vectors below are read by every worker on every packet
+   * and grown by the main thread here. vec_validate_init_empty () reallocates,
+   * which frees the block a worker may be halfway through dereferencing -- a
+   * use-after-free that surfaces as a SIGSEGV in abf_input_ip4 reading a vector
+   * header at some small garbage address. It moves around (0x1b, 0x6b, ...)
+   * because what lands in a freed block is whatever the allocator wrote there,
+   * which is why bounds checks in the dataplane only relocated the crash.
+   *
+   * Every other plugin that mutates dataplane-visible state does this under the
+   * worker barrier (see dhcp/client.c, linux-cp/lcp_nl.c); abf never did.
+   */
+  vlib_worker_thread_barrier_sync (vlib_get_main ());
+
   vec_validate_init_empty (abf_per_itf[fproto], sw_if_index, NULL);
   vec_add1 (abf_per_itf[fproto][sw_if_index], aia - abf_itf_attach_pool);
   if (1 == vec_len (abf_per_itf[fproto][sw_if_index]))
@@ -244,6 +259,8 @@ abf_itf_attach (fib_protocol_t fproto,
   /* Prepare and set the list of ACLs for lookup within the context */
   abf_setup_acl_lc (fproto, sw_if_index);
 
+  vlib_worker_thread_barrier_release (vlib_get_main ());
+
   /*
    * become a child of the ABF policy so we are notified when
    * its forwarding changes.
@@ -271,7 +288,12 @@ abf_itf_detach (fib_protocol_t fproto, u32 policy_id, u32 sw_if_index)
 
   /*
    * first remove from the interface's vector
+   *
+   * Under the worker barrier for the same reason as the attach path: these
+   * vectors are read by every worker on every packet.
    */
+  vlib_worker_thread_barrier_sync (vlib_get_main ());
+
   ASSERT (abf_per_itf[fproto]);
   ASSERT (abf_per_itf[fproto][sw_if_index]);
 
@@ -308,6 +330,8 @@ abf_itf_detach (fib_protocol_t fproto, u32 policy_id, u32 sw_if_index)
 
   /* Prepare and set the list of ACLs for lookup within the context */
   abf_setup_acl_lc (fproto, sw_if_index);
+
+  vlib_worker_thread_barrier_release (vlib_get_main ());
 
   /*
    * remove the dependency on the policy
@@ -532,7 +556,9 @@ abf_input_inline (vlib_main_t * vm,
 	  u32 match_rule_index = ~0;
 	  u32 trace_bitmap = 0;
 	  u32 lc_index;
+	  u32 n_attach0;
 	  u8 action;
+	  u8 have_abf0;
 
 	  bi0 = from[0];
 	  to_next[0] = bi0;
@@ -544,10 +570,102 @@ abf_input_inline (vlib_main_t * vm,
 	  b0 = vlib_get_buffer (vm, bi0);
 	  sw_if_index0 = vnet_buffer (b0)->sw_if_index[VLIB_RX];
 
-	  ASSERT (vec_len (abf_per_itf[fproto]) > sw_if_index0);
+	  /*
+	   * abf_per_itf / abf_alctx_per_itf are grown by the main thread when
+	   * a policy is attached to an interface. A packet can still arrive
+	   * here on an interface those vectors do not cover: the feature arc
+	   * is armed per interface and outlives the attachment that armed it
+	   * (the plugin gets no callback on interface delete), so a config
+	   * restore -- which creates and destroys interfaces while the arc
+	   * stays enabled -- can hand this node an index past the end.
+	   *
+	   * The ASSERTs that used to stand here are compiled out in a release
+	   * build, so the read went ahead anyway and produced a garbage
+	   * attachments0 (0x23 in the crashes seen here, faulting at 0x1b
+	   * when its vector header was read). That is a SIGSEGV on a worker
+	   * thread: VPP aborts, systemd restarts it into the same config, and
+	   * it crashes again -- a loop the restore never gets out of.
+	   *
+	   * No ABF state for the interface means no policy to apply, so treat
+	   * it as a miss and let the packet continue down the feature arc.
+	   */
+	  have_abf0 =
+	    (sw_if_index0 < vec_len (abf_per_itf[fproto]) &&
+	     sw_if_index0 < vec_len (abf_alctx_per_itf[fproto]));
+
+	  /*
+	   * A covered index is not the same as a usable one. The lookup
+	   * context is ~0 both before the first policy is attached and again
+	   * after the last one is detached (abf_itf_detach), and
+	   * vec_validate_init_empty () fills every index it grows past with ~0
+	   * as well -- so an interface can sit inside the vector with no
+	   * context at all while the feature arc is still armed on it.
+	   *
+	   * Handing ~0 to the ACL matcher indexes its context pool out of
+	   * bounds and hands back a garbage pointer: SIGSEGV on a worker.
+	   * abf_setup_acl_lc () already tests for ~0 on the control path; the
+	   * dataplane never did.
+	   */
+	  if (PREDICT_TRUE (have_abf0))
+	    have_abf0 = (~0 != abf_alctx_per_itf[fproto][sw_if_index0]);
+
+	  if (PREDICT_FALSE (!have_abf0))
+	    {
+	      vnet_feature_next (&next0, b0);
+	      misses++;
+	      goto trace0;
+	    }
+
 	  attachments0 = abf_per_itf[fproto][sw_if_index0];
 
-	  ASSERT (vec_len (abf_alctx_per_itf[fproto]) > sw_if_index0);
+	  /*
+	   * Last line of defence, and a diagnostic.
+	   *
+	   * Every bounds check above has passed and this slot should hold
+	   * either NULL or a heap pointer, yet crashes here have read vector
+	   * headers at 0x1b and 0x6b -- i.e. the slot held a small integer.
+	   * Something is writing an index where a pointer belongs, or the
+	   * vector is being observed mid-realloc; three rounds of narrowing
+	   * have not pinned which.
+	   *
+	   * Rather than fault again, refuse the value and say so once. A
+	   * dropped ABF policy on one interface is recoverable; taking the box
+	   * down every few minutes is not, and the message names the values
+	   * the next investigation needs.
+	   */
+	  if (PREDICT_FALSE (attachments0 != NULL &&
+			     (uword) attachments0 < 0x1000))
+	    {
+	      static u8 reported = 0;
+	      if (!reported)
+		{
+		  reported = 1;
+		  clib_warning (
+		    "abf: refusing a bogus attachment vector on sw_if_index %u "
+		    "(fproto %d): pointer %p, per-itf len %u, alctx len %u, "
+		    "lc_index %u. The packet is passed on down the feature "
+		    "arc; ABF is not applied to it.",
+		    sw_if_index0, fproto, attachments0,
+		    vec_len (abf_per_itf[fproto]),
+		    vec_len (abf_alctx_per_itf[fproto]),
+		    abf_alctx_per_itf[fproto][sw_if_index0]);
+		}
+	      vnet_feature_next (&next0, b0);
+	      misses++;
+	      goto trace0;
+	    }
+
+	  /*
+	   * Take the length here, not at the point of use.
+	   *
+	   * vec_len () later re-reads the vector header, and the compiler had
+	   * spilled the base and index across the ACL match and re-derived
+	   * attachments0 from them -- so the read that faulted was outside the
+	   * window checked above. Reading it once, now, keeps the check and the
+	   * use on the same value.
+	   */
+	  n_attach0 = vec_len (attachments0);
+
 	  /*
 	   * check if any of the policies attached to this interface matches.
 	   */
@@ -577,13 +695,40 @@ abf_input_inline (vlib_main_t * vm,
 	      /*
 	       * match:
 	       *  follow the DPO chain
+	       *
+	       * match_acl_pos is a position in the ACL lookup context, and is
+	       * used here as an index into this interface's attachment vector.
+	       * The two are only in step while the context and abf_per_itf
+	       * describe the same set of policies -- and they are maintained
+	       * separately, from the main thread, while this node runs on a
+	       * worker. A detach that has updated one but not yet the other
+	       * (or an attach record left behind by an interface delete, which
+	       * the plugin has no callback for) leaves a position pointing
+	       * past the end of the vector.
+	       *
+	       * The ASSERTs above are compiled out in a release build, so
+	       * without this check that reads out of bounds and dereferences
+	       * whatever it finds: a hard SIGSEGV in the dataplane, taking the
+	       * whole box down and restarting it into the same state. Treat an
+	       * out-of-range position as a miss and let the packet continue
+	       * down the feature arc -- the policy is not applied for this
+	       * packet, which is the same outcome as the detach that caused
+	       * the skew, and vastly better than crashing.
 	       */
-	      aia0 = abf_itf_attach_get (attachments0[match_acl_pos]);
+	      if (PREDICT_FALSE (match_acl_pos >= n_attach0))
+		{
+		  vnet_feature_next (&next0, b0);
+		  misses++;
+		}
+	      else
+		{
+		  aia0 = abf_itf_attach_get (attachments0[match_acl_pos]);
 
-	      next0 = aia0->aia_dpo.dpoi_next_node;
-	      vnet_buffer (b0)->ip.adj_index[VLIB_TX] =
-		aia0->aia_dpo.dpoi_index;
-	      matches++;
+		  next0 = aia0->aia_dpo.dpoi_next_node;
+		  vnet_buffer (b0)->ip.adj_index[VLIB_TX] =
+		    aia0->aia_dpo.dpoi_index;
+		  matches++;
+		}
 	    }
 	  else
 	    {
@@ -595,6 +740,7 @@ abf_input_inline (vlib_main_t * vm,
 	      misses++;
 	    }
 
+	trace0:
 	  if (PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))
 	    {
 	      abf_input_trace_t *tr;
@@ -613,15 +759,22 @@ abf_input_inline (vlib_main_t * vm,
       vlib_put_next_frame (vm, node, next_index, n_left_to_next);
     }
 
+  /*
+   * Upstream wrote `fproto = FIB_PROTOCOL_IP6` here, an assignment whose
+   * value is always non-zero, so both counters always landed on the ip4
+   * node -- and the ip6 arc reported nothing at all. `show err` is the
+   * first place anyone looks when ABF is not doing what they expect, so
+   * it has to name the node that actually ran.
+   */
   vlib_node_increment_counter (vm,
-			       (fproto = FIB_PROTOCOL_IP6 ?
-				abf_ip4_node.index :
-				abf_ip6_node.index),
+			       (FIB_PROTOCOL_IP6 == fproto ?
+				abf_ip6_node.index :
+				abf_ip4_node.index),
 			       ABF_ERROR_MATCHED, matches);
   vlib_node_increment_counter (vm,
-			       (fproto = FIB_PROTOCOL_IP6 ?
-				abf_ip4_node.index :
-				abf_ip6_node.index),
+			       (FIB_PROTOCOL_IP6 == fproto ?
+				abf_ip6_node.index :
+				abf_ip4_node.index),
 			       ABF_ERROR_MISSED, misses);
 
   return frame->n_vectors;

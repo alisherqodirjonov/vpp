@@ -316,9 +316,23 @@ typedef CLIB_PACKED(struct
   /* Last HA refresh */
   f64 ha_last_refreshed;
 
-  /* Counters */
+  /* Counters.
+   *
+   * total_* is the sum of both directions and is what the v3 dump API
+   * reports; the per-direction pairs are what a traffic log needs, because
+   * "this client sent 2 MB and received 40 MB" and the reverse are very
+   * different facts and the total cannot tell them apart. Split here rather
+   * than derived later: the direction is known at the point the packet is
+   * counted and nowhere afterwards.
+   *
+   * i2o is inside-to-outside (the client's upload), o2i the reverse.
+   */
   u64 total_bytes;
   u32 total_pkts;
+  u64 i2o_bytes;
+  u64 o2i_bytes;
+  u32 i2o_pkts;
+  u32 o2i_pkts;
 
   /* External host address and port */
   ip4_address_t ext_host_addr;

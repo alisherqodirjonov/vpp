@@ -131,7 +131,8 @@ typedef void (*hss_session_send_fn) (hss_url_handler_args_t *args);
 
 #define foreach_hss_listener_flags                                            \
   _ (HTTP1_ONLY)                                                              \
-  _ (NEED_CRYPTO)
+  _ (NEED_CRYPTO)                                                             \
+  _ (CATCH_ALL)
 
 typedef enum hss_listener_flags_bit_
 {
@@ -171,6 +172,10 @@ typedef struct hss_listener_
   u8 *max_age_formatted;
   /** Enable the use of builtinurls */
   u8 enable_url_handlers;
+  /** Cert and key pair index for tls listeners, ~0 => the built-in
+      self-signed test cert. Obtain a real one over the binary API with
+      app_add_cert_key_pair. */
+  u32 ckpair_index;
   /** Index in listener pool */
   u32 l_index;
   /** Listener session handle */
@@ -228,6 +233,8 @@ typedef struct
 extern hss_main_t hss_main;
 
 int hss_create (vlib_main_t *vm);
+int hss_listener_add (hss_listener_t *l_cfg);
+int hss_listener_del (hss_listener_t *l_cfg);
 
 static inline hss_listener_t *
 hss_listener_get (u32 l_index)

@@ -90,6 +90,12 @@ format_snat_session (u8 * s, va_list * args)
 	      nat44_session_get_timeout (sm, sess) - (now - sess->last_heard));
   s = format (s, "       total pkts %d, total bytes %lld\n", sess->total_pkts,
 	      sess->total_bytes);
+  /* The split matters more than the total for reading a session: it says
+     whether a host is uploading or downloading, which the sum cannot. */
+  s = format (s, "       i2o pkts %d, i2o bytes %lld\n", sess->i2o_pkts,
+	      sess->i2o_bytes);
+  s = format (s, "       o2i pkts %d, o2i bytes %lld\n", sess->o2i_pkts,
+	      sess->o2i_bytes);
   if (nat44_ed_is_session_static (sess))
     s = format (s, "       static translation\n");
   else

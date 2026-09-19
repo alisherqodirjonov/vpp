@@ -24,6 +24,9 @@
 #include <stdbool.h>
 
 /* define message IDs */
+#include <vlib/unix/plugin.h>
+#include <dp_log/dp_log.h>
+
 #include <dns/dns.api_enum.h>
 #include <dns/dns.api_types.h>
 
@@ -242,7 +245,22 @@ vnet_dns_send_dns4_request (vlib_main_t * vm, dns_main_t * dm,
   ASSERT (ep->dns_request);
 
   if (!ip4_sas (0 /* default VRF for now */, ~0, server, &src_address))
-    return;
+    {
+      /*
+       * No source address for the route to this server, so the query is
+       * never sent and the client just waits. This used to be a silent
+       * return -- the single most confusing failure mode here, because
+       * blocked names keep answering instantly while everything else
+       * simply hangs. Usual causes: no route to the server in the DEFAULT
+       * VRF (this lookup is hardcoded to table 0), or the egress interface
+       * has no address.
+       */
+      clib_warning ("dns: no source address for a query to %U in VRF 0 -- "
+		    "'%s' cannot be resolved. Check that the data plane has "
+		    "a route to the upstream server in the default table.",
+		    format_ip4_address, server, ep->name);
+      return;
+    }
 
   /* Go get a buffer */
   if (vlib_buffer_alloc (vm, &bi, 1) != 1)
@@ -682,6 +700,15 @@ dns_add_static_entry (dns_main_t * dm, u8 * name, u8 * dns_reply_data)
   if (dm->is_enabled == 0)
     return VNET_API_ERROR_NAME_RESOLUTION_NOT_ENABLED;
 
+  /*
+   * The cache is a strlen-keyed string hash, so the name has to be
+   * NUL-terminated before either the lookup below or the insert further
+   * down reads it -- the CLI hands us a bare %v vector. Terminate first,
+   * then case-fold, matching what every lookup does.
+   */
+  vec_terminate_c_string (name);
+  dns_normalize_name (name);
+
   dns_cache_lock (dm, 4);
   p = hash_get_mem (dm->cache_entry_by_name, name);
   if (p)
@@ -735,6 +762,14 @@ vnet_dns_resolve_name (vlib_main_t * vm, dns_main_t * dm, u8 * name,
   /* binary API caller might forget to set the name. Guess how we know. */
   if (name[0] == 0)
     return VNET_API_ERROR_INVALID_VALUE;
+
+  /*
+   * Case-fold before touching the cache. Every lookup funnels through here,
+   * so this is what keeps "Facebook.com" from missing a static entry stored
+   * as "facebook.com" (and re-resolving upstream, i.e. defeating a block).
+   * Callers all pass a private copy or a writable message buffer.
+   */
+  dns_normalize_name (name);
 
   dns_cache_lock (dm, 5);
 search_again:
@@ -803,8 +838,18 @@ search_again:
 	{
 	  /*
 	   * Resolution pending. Add request to the pending vector
-	   * by copying the template request
+	   * by copying the template request.
+	   *
+	   * Bounded: see DNS_MAX_PENDING_REQUESTS. Once enough requests are
+	   * parked, further ones are dropped rather than queued -- they are
+	   * retransmits of queries already parked here, and queuing them only
+	   * builds up a reply/log storm for when resolution lands.
 	   */
+	  if (vec_len (ep->pending_requests) >= DNS_MAX_PENDING_REQUESTS)
+	    {
+	      dns_cache_unlock (dm);
+	      return (0);
+	    }
 	  vec_add2 (ep->pending_requests, pr, 1);
 	  memcpy (pr, t, sizeof (*pr));
 	  dns_cache_unlock (dm);
@@ -987,6 +1032,9 @@ found_last_request:
   cname = vnet_dns_labels_to_name (rr->rdata, reply, &pos2);
   /* Save the cname */
   dns_terminate_c_string (&cname);
+  /* Upstream sends the cname back in whatever case it likes; the chain is
+     walked via cache_entry_by_name, so fold it like every other key. */
+  dns_normalize_name (cname);
   ep = pool_elt_at_index (dm->entries, ep_index);
   ep->cname = cname;
   ep->flags |= (DNS_CACHE_ENTRY_FLAG_CNAME | DNS_CACHE_ENTRY_FLAG_VALID);
@@ -1383,12 +1431,20 @@ vl_api_dns_resolve_name_t_handler (vl_api_dns_resolve_name_t * mp)
   if (ep == 0)
     return;
 
+  /* Must match how resolver_process.c fills the async reply: an ip6 answer
+     copied into ip4_address lands 4 bytes into the field and spills the
+     remaining 12 into ip6_address, so the client reads a shifted address. */
   REPLY_MACRO2 (VL_API_DNS_RESOLVE_NAME_REPLY, ({
-		  ip_address_copy_addr (rmp->ip4_address, &rn.address);
 		  if (ip_addr_version (&rn.address) == AF_IP4)
-		    rmp->ip4_set = 1;
+		    {
+		      ip_address_copy_addr (rmp->ip4_address, &rn.address);
+		      rmp->ip4_set = 1;
+		    }
 		  else
-		    rmp->ip6_set = 1;
+		    {
+		      ip_address_copy_addr (rmp->ip6_address, &rn.address);
+		      rmp->ip6_set = 1;
+		    }
 		}));
 }
 
@@ -1485,44 +1541,285 @@ dns_config_fn (vlib_main_t * vm, unformat_input_t * input)
 
 VLIB_CONFIG_FUNCTION (dns_config_fn, "dns");
 
-uword
-unformat_dns_reply (unformat_input_t * input, va_list * args)
+/* ---------------------------------------------------------------------------
+ * Per-client-subnet block page addresses
+ * ------------------------------------------------------------------------ */
+
+static inline u32
+dns_prefix_mask (u8 mask_len)
 {
-  u8 **result = va_arg (*args, u8 **);
-  u8 **namep = va_arg (*args, u8 **);
-  ip4_address_t a4;
-  ip6_address_t a6;
-  int a4_set = 0;
-  int a6_set = 0;
-  u8 *name;
-  int name_set = 0;
+  if (mask_len == 0)
+    return 0;
+  if (mask_len >= 32)
+    return 0xffffffff;
+  return 0xffffffff << (32 - mask_len);
+}
+
+/**
+ * Add, replace or remove one prefix -> block-address rule.
+ *
+ * Rules are kept in a short unsorted vector and matched longest-prefix-first
+ * at lookup: a box has a handful of LANs, so a full table would cost more
+ * than it saves.
+ */
+int
+dns_block_redirect_add_del (dns_main_t * dm, ip4_address_t * prefix,
+			    u8 mask_len, ip4_address_t * address, int is_add)
+{
+  dns_block_redirect_t *r;
+  u32 masked;
+  int i;
+
+  if (mask_len > 32)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  masked = clib_net_to_host_u32 (prefix->as_u32) & dns_prefix_mask (mask_len);
+
+  for (i = 0; i < vec_len (dm->block_redirects); i++)
+    {
+      r = dm->block_redirects + i;
+      if (r->mask_len != mask_len ||
+	  clib_net_to_host_u32 (r->network.as_u32) != masked)
+	continue;
+
+      if (is_add)
+	{
+	  r->address = *address;
+	  return 0;
+	}
+      vec_delete (dm->block_redirects, 1, i);
+      return 0;
+    }
+
+  if (!is_add)
+    return VNET_API_ERROR_NO_SUCH_ENTRY;
+
+  vec_add2 (dm->block_redirects, r, 1);
+  r->network.as_u32 = clib_host_to_net_u32 (masked);
+  r->address = *address;
+  r->mask_len = mask_len;
+  return 0;
+}
+
+void
+dns_block_redirect_flush (dns_main_t * dm)
+{
+  vec_free (dm->block_redirects);
+}
+
+/**
+ * Longest-prefix match for a client address. Returns 1 and fills result on
+ * a hit, 0 when no rule covers this client.
+ */
+int
+dns_block_redirect_lookup (dns_main_t * dm, const void *client_addr,
+			   ip4_address_t * result)
+{
+  ip4_address_t client;
+  u32 host_order;
+  int i, best = -1;
+
+  if (vec_len (dm->block_redirects) == 0)
+    return 0;
+
+  clib_memcpy_fast (&client, client_addr, sizeof (client));
+  host_order = clib_net_to_host_u32 (client.as_u32);
+
+  for (i = 0; i < vec_len (dm->block_redirects); i++)
+    {
+      dns_block_redirect_t *r = dm->block_redirects + i;
+      u32 mask = dns_prefix_mask (r->mask_len);
+
+      if ((host_order & mask) != clib_net_to_host_u32 (r->network.as_u32))
+	continue;
+
+      if (best < 0 || r->mask_len > dm->block_redirects[best].mask_len)
+	best = i;
+    }
+
+  if (best < 0)
+    return 0;
+
+  *result = dm->block_redirects[best].address;
+  return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * DNS query logging
+ *
+ * Events go to the dp_log plugin, which owns a lock-free per-thread ring and
+ * a writer thread -- the same path the ACL drop log uses. The symbol is
+ * resolved at runtime rather than linked, so the DNS plugin keeps working
+ * unchanged when dp_log_plugin.so is not loaded.
+ * ------------------------------------------------------------------------ */
+
+typedef int (*dns_dp_log_enq_fn_t) (u32, const dp_log_dns_event_t *);
+static dns_dp_log_enq_fn_t dns_dp_log_enq_fp;
+static u8 *dns_dp_log_mode_p;
+static int dns_dp_log_resolved;
+
+static void
+dns_dp_log_resolve_once (void)
+{
+  if (PREDICT_TRUE (dns_dp_log_resolved))
+    return;
+
+  dns_dp_log_resolved = 1;
+
+  dns_dp_log_enq_fp = (dns_dp_log_enq_fn_t) vlib_get_plugin_symbol (
+    "dp_log_plugin.so", "dp_log_dns_enq_export");
+  dns_dp_log_mode_p =
+    (u8 *) vlib_get_plugin_symbol ("dp_log_plugin.so", "dp_log_dns_mode");
+
+  if (dns_dp_log_enq_fp == 0 || dns_dp_log_mode_p == 0)
+    {
+      dns_dp_log_enq_fp = 0;
+      clib_warning ("dns: query logging unavailable (dp_log_plugin.so not "
+		    "loaded or symbols missing)");
+    }
+}
+
+/**
+ * Record one answered query: who asked, what they asked for, and what we
+ * told them.
+ *
+ * ep is the cache entry the answer came from, or 0 when resolution is still
+ * pending upstream -- the resolver process logs those once the answer
+ * actually arrives, so a name is logged when it is answered, never twice.
+ *
+ * The mode check is one relaxed byte load through a pointer resolved once,
+ * so with logging off this costs a branch.
+ */
+void
+dns_log_query (u32 thread_index, u8 *name, int client_is_ip6,
+	       const void *client_addr, dns_cache_entry_t *ep)
+{
+  dp_log_dns_event_t ev;
+  dns_resolve_name_t rn = { 0 };
+  vlib_main_t *vm = vlib_get_main ();
+  int blocked, mode;
+  u32 name_len;
+
+  dns_dp_log_resolve_once ();
+  if (dns_dp_log_enq_fp == 0)
+    return;
+
+  mode = __atomic_load_n (dns_dp_log_mode_p, __ATOMIC_RELAXED);
+  if (mode == DP_LOG_DNS_OFF)
+    return;
+
+  blocked = (ep && (ep->flags & DNS_CACHE_ENTRY_FLAG_STATIC)) ? 1 : 0;
+  if (mode == DP_LOG_DNS_BLOCKED && !blocked)
+    return;
+
+  clib_memset (&ev, 0, sizeof (ev));
+  ev.ts_ns = (u64) (vlib_time_now (vm) * 1e9);
+  ev.blocked = blocked;
+
+  ev.is_ip6 = client_is_ip6 ? 1 : 0;
+  if (client_is_ip6)
+    clib_memcpy_fast (&ev.client.v6, client_addr, sizeof (ip6_address_t));
+  else
+    clib_memcpy_fast (&ev.client.v4, client_addr, sizeof (ip4_address_t));
+
+  /* name is a NUL-terminated cache key by the time we get here */
+  name_len = name ? (u32) strlen ((char *) name) : 0;
+  if (name_len > sizeof (ev.name) - 1)
+    name_len = sizeof (ev.name) - 1;
+  if (name_len)
+    clib_memcpy_fast (ev.name, name, name_len);
+  ev.name_len = (u16) name_len;
+
+  if (ep && vnet_dns_response_to_reply (ep->dns_response, &rn, 0) == 0)
+    {
+      ev.has_answer = 1;
+      if (ip_addr_version (&rn.address) == AF_IP4)
+	{
+	  ip4_address_t answer4;
+
+	  clib_memcpy_fast (&answer4, &ip_addr_v4 (&rn.address),
+			    sizeof (answer4));
+
+	  /*
+	   * Log what this client was actually told, not what the entry
+	   * stores. vnet_send_dns4_reply () rewrites a blocked answer to the
+	   * block page on the client's own segment, so logging the stored
+	   * address would report every LAN as being sent to the first one.
+	   */
+	  if (blocked && !client_is_ip6)
+	    {
+	      ip4_address_t local_block;
+
+	      if (dns_block_redirect_lookup (&dns_main, client_addr,
+					     &local_block))
+		answer4 = local_block;
+	    }
+
+	  clib_memcpy_fast (&ev.answer.v4, &answer4, sizeof (answer4));
+	}
+      else
+	{
+	  ev.answer_is_ip6 = 1;
+	  clib_memcpy_fast (&ev.answer.v6, &ip_addr_v6 (&rn.address),
+			    sizeof (ip6_address_t));
+	}
+    }
+
+  (void) dns_dp_log_enq_fp (thread_index, &ev);
+}
+
+/**
+ * Lower-case a DNS name in place.
+ *
+ * Names are case-insensitive (RFC 4343), but dm->cache_entry_by_name is a
+ * case-sensitive string hash. Without normalization "Facebook.com" and
+ * "facebook.com" land on different cache entries -- which means a static
+ * block entry stored in lower case is bypassed by simply asking for the
+ * name with a capital letter. Everything that enters or looks up the
+ * cache runs through here.
+ *
+ * NB: this walks to the NUL, exactly like the strlen-keyed string hash it
+ * exists to agree with. It must NOT use vec_len (): names reach the cache
+ * both as vppinfra vectors AND as plain C arrays inside API messages
+ * (vl_api_dns_resolve_name_t::name is u8[256] in a packed struct, with no
+ * vector header in front of it), and reading a vector header that isn't
+ * there yields a garbage length and a write straight off the end.
+ *
+ * Every caller must therefore pass a NUL-terminated buffer -- which is
+ * already what vnet_dns_resolve_name () and hash_get_mem () require.
+ */
+void
+dns_normalize_name (u8 * name)
+{
+  u8 *p;
+
+  for (p = name; *p; p++)
+    if (*p >= 'A' && *p <= 'Z')
+      *p += 'a' - 'A';
+}
+
+/**
+ * Build the canned response blob for a static cache entry: a synthetic
+ * DNS reply carrying an A and/or an AAAA record for <name>.
+ *
+ * Shared by the CLI ("dns cache add") and the binary API. Returns a vector
+ * which the caller hands to dns_add_static_entry (), which takes ownership
+ * of it. <name> is read, not consumed, and must be a non-NULL-terminated
+ * vector -- name_to_labels () would otherwise emit a bogus trailing label.
+ *
+ * Returns 0 if neither address is supplied.
+ */
+u8 *
+dns_build_static_reply (u8 * name, ip4_address_t * a4, ip6_address_t * a6)
+{
+  int a4_set = (a4 != 0);
+  int a6_set = (a6 != 0);
   u8 *ce;
   u32 qp_offset;
   dns_header_t *h;
   dns_query_t *qp;
   dns_rr_t *rr;
   u8 *rru8;
-
-  if (unformat (input, "%v", &name))
-    name_set = 1;
-
-  if (unformat (input, "%U", unformat_ip4_address, &a4))
-    {
-      a4_set = 1;
-      if (unformat (input, "%U", unformat_ip6_address, &a6))
-	a6_set = 1;
-    }
-
-  if (unformat (input, "%U", unformat_ip6_address, &a6))
-    {
-      a6_set = 1;
-      if (unformat (input, "%U", unformat_ip4_address, &a6))
-	a4_set = 1;
-    }
-
-  /* Must have a name */
-  if (!name_set)
-    return 0;
 
   /* Must have at least one address */
   if (!(a4_set + a6_set))
@@ -1565,7 +1862,7 @@ unformat_dns_reply (unformat_input_t * input, va_list * args)
       rr->class = clib_host_to_net_u16 (DNS_CLASS_IN);
       rr->ttl = clib_host_to_net_u32 (86400);
       rr->rdlength = clib_host_to_net_u16 (4);
-      memcpy (rr->rdata, &a4, sizeof (a4));
+      memcpy (rr->rdata, a4, sizeof (*a4));
     }
   if (a6_set)
     {
@@ -1578,8 +1875,61 @@ unformat_dns_reply (unformat_input_t * input, va_list * args)
       rr->class = clib_host_to_net_u16 (DNS_CLASS_IN);
       rr->ttl = clib_host_to_net_u32 (86400);
       rr->rdlength = clib_host_to_net_u16 (16);
-      memcpy (rr->rdata, &a6, sizeof (a6));
+      memcpy (rr->rdata, a6, sizeof (*a6));
     }
+
+  return ce;
+}
+
+uword
+unformat_dns_reply (unformat_input_t * input, va_list * args)
+{
+  u8 **result = va_arg (*args, u8 **);
+  u8 **namep = va_arg (*args, u8 **);
+  ip4_address_t a4;
+  ip6_address_t a6;
+  int a4_set = 0;
+  int a6_set = 0;
+  u8 *name;
+  int name_set = 0;
+  u8 *ce;
+
+  if (unformat (input, "%v", &name))
+    name_set = 1;
+
+  if (unformat (input, "%U", unformat_ip4_address, &a4))
+    {
+      a4_set = 1;
+      if (unformat (input, "%U", unformat_ip6_address, &a6))
+	a6_set = 1;
+    }
+
+  if (unformat (input, "%U", unformat_ip6_address, &a6))
+    {
+      a6_set = 1;
+      /*
+       * Note: the second address on the line is an ip4 address, and it
+       * belongs in a4. Parsing it into a6 (as this did) both clobbered the
+       * ip6 address just parsed and left a4 uninitialized while claiming
+       * a4_set -- so "dns cache add <name> <ip6> <ip4>" produced garbage.
+       */
+      if (unformat (input, "%U", unformat_ip4_address, &a4))
+	a4_set = 1;
+    }
+
+  /* Must have a name */
+  if (!name_set)
+    return 0;
+
+  ce = dns_build_static_reply (name, a4_set ? &a4 : 0, a6_set ? &a6 : 0);
+
+  /* Must have at least one address */
+  if (ce == 0)
+    {
+      vec_free (name);
+      return 0;
+    }
+
   *result = ce;
   if (namep)
     *namep = name;
@@ -2068,7 +2418,11 @@ format_dns_cache (u8 * s, va_list * args)
       return s;
     }
 
-  s = format (s, "DNS cache contains %d entries\n", pool_elts (dm->entries));
+  /* The limit matters as much as the count: at max-cache-size the resolver
+     starts evicting a random entry per new name, so a cache sitting at its
+     ceiling is thrashing and nothing else says so. Default is 1000. */
+  s = format (s, "DNS cache contains %d entries (limit %d)\n",
+	      pool_elts (dm->entries), dm->name_cache_size);
 
   if (verbose > 0)
     {
@@ -2743,6 +3097,18 @@ vnet_send_dns4_reply (vlib_main_t * vm, dns_main_t * dm,
 	  /* clib_warning ("No A-record..."); */
 	  is_fail = 1;
 	}
+      else if (ep->flags & DNS_CACHE_ENTRY_FLAG_STATIC)
+	{
+	  /*
+	   * Blocked name: send this client to the block page on its own
+	   * segment when a rule covers it. Only static entries are rewritten
+	   * -- a real upstream answer must never be altered.
+	   */
+	  ip4_address_t local_block;
+
+	  if (dns_block_redirect_lookup (dm, pr->dst_address, &local_block))
+	    ip_address_set (&rn->address, &local_block, AF_IP4);
+	}
     }
   else if (pr->request_type == DNS_PEER_PENDING_IP_TO_NAME)
     {
@@ -2912,6 +3278,123 @@ vnet_send_dns4_reply (vlib_main_t * vm, dns_main_t * dm,
       f->n_vectors = 1;
       vlib_put_frame_to_node (vm, ip4_lookup_node.index, f);
     }
+}
+
+/**
+ * Add or delete a static cache entry from the binary API.
+ *
+ * This is the control-plane half of "dns cache add/del": it lets an agent
+ * pin a name to an address without shelling out to the CLI. Pinning a name
+ * to a local web server is how a blocked domain gets redirected to a block
+ * page -- static entries never expire and are answered straight out of the
+ * dataplane, so they take precedence over anything upstream would return.
+ */
+static void
+vl_api_dns_cache_add_del_t_handler (vl_api_dns_cache_add_del_t * mp)
+{
+  vl_api_dns_cache_add_del_reply_t *rmp;
+  dns_main_t *dm = &dns_main;
+  ip4_address_t a4;
+  ip6_address_t a6;
+  u8 *dns_reply_data;
+  u8 *name;
+  int rv;
+
+  /* The name is a fixed-size field; a non-terminated one is caller error */
+  mp->name[ARRAY_LEN (mp->name) - 1] = 0;
+  if (mp->name[0] == 0)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+
+  /* %s stops at the NULL, so this is the un-terminated vector form that
+     name_to_labels () and the cache hash both want. */
+  /*
+   * Deliberately NOT case-folded here: dns_build_static_reply () below runs
+   * name_to_labels () over this vector, which is length-based and must not
+   * see a trailing NUL. dns_add_static_entry () terminates and folds it.
+   */
+  name = format (0, "%s", mp->name);
+
+  if (mp->is_add == 0)
+    {
+      /* dns_delete_by_name () hashes with strlen (), and the stored key is
+         folded, so terminate and fold before looking it up. */
+      vec_add1 (name, 0);
+      dns_normalize_name (name);
+      rv = dns_delete_by_name (dm, name);
+      vec_free (name);
+      goto done;
+    }
+
+  if (mp->ip4_set == 0 && mp->ip6_set == 0)
+    {
+      vec_free (name);
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+
+  clib_memcpy (&a4, mp->ip4_address, sizeof (a4));
+  clib_memcpy (&a6, mp->ip6_address, sizeof (a6));
+
+  dns_reply_data = dns_build_static_reply (name, mp->ip4_set ? &a4 : 0,
+					   mp->ip6_set ? &a6 : 0);
+  if (dns_reply_data == 0)
+    {
+      vec_free (name);
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+
+  /* Consumes both vectors on success */
+  rv = dns_add_static_entry (dm, name, dns_reply_data);
+  if (rv)
+    {
+      vec_free (name);
+      vec_free (dns_reply_data);
+    }
+
+done:
+  REPLY_MACRO (VL_API_DNS_CACHE_ADD_DEL_REPLY);
+}
+
+static void
+vl_api_dns_cache_clear_t_handler (vl_api_dns_cache_clear_t * mp)
+{
+  vl_api_dns_cache_clear_reply_t *rmp;
+  dns_main_t *dm = &dns_main;
+  int rv;
+
+  rv = dns_cache_clear (dm);
+
+  REPLY_MACRO (VL_API_DNS_CACHE_CLEAR_REPLY);
+}
+
+static void
+vl_api_dns_block_redirect_add_del_t_handler (
+  vl_api_dns_block_redirect_add_del_t * mp)
+{
+  vl_api_dns_block_redirect_add_del_reply_t *rmp;
+  dns_main_t *dm = &dns_main;
+  ip4_address_t prefix, address;
+  int rv;
+
+  if (mp->flush)
+    {
+      dns_block_redirect_flush (dm);
+      rv = 0;
+      goto done;
+    }
+
+  clib_memcpy (&prefix, mp->prefix, sizeof (prefix));
+  clib_memcpy (&address, mp->address, sizeof (address));
+
+  rv = dns_block_redirect_add_del (dm, &prefix, mp->prefix_len, &address,
+				   mp->is_add);
+
+done:
+  REPLY_MACRO (VL_API_DNS_BLOCK_REDIRECT_ADD_DEL_REPLY);
 }
 
 #include <dns/dns.api.c>

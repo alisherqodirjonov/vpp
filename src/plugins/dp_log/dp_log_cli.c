@@ -8,15 +8,48 @@
  * Here we keep it minimal: enabled flag only.
  */
 
+static const char *
+dp_log_dns_mode_name (int mode)
+{
+  switch (mode)
+    {
+    case DP_LOG_DNS_ALL:
+      return "all";
+    case DP_LOG_DNS_BLOCKED:
+      return "blocked";
+    default:
+      return "off";
+    }
+}
+
 static clib_error_t *
 dp_log_cli_enable_disable (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
+  /* "dp-log dns ..." selects the DNS query log, which is switched
+     independently of the ACL drop log. */
+  if (unformat (input, "dns"))
+    {
+      if (unformat (input, "off") || unformat (input, "disable"))
+	__atomic_store_n (&dp_log_dns_mode, DP_LOG_DNS_OFF, __ATOMIC_RELAXED);
+      else if (unformat (input, "blocked"))
+	__atomic_store_n (&dp_log_dns_mode, DP_LOG_DNS_BLOCKED,
+			  __ATOMIC_RELAXED);
+      else if (unformat (input, "all"))
+	__atomic_store_n (&dp_log_dns_mode, DP_LOG_DNS_ALL, __ATOMIC_RELAXED);
+      else
+	return clib_error_return (0, "usage: dp-log dns off|blocked|all");
+
+      vlib_cli_output (vm, "dp-log dns %s",
+		       dp_log_dns_mode_name (dp_log_dns_mode_get ()));
+      return 0;
+    }
+
   if (unformat (input, "enable"))
     __atomic_store_n (&dp_log_enabled, 1, __ATOMIC_RELAXED);
   else if (unformat (input, "disable"))
     __atomic_store_n (&dp_log_enabled, 0, __ATOMIC_RELAXED);
   else
-    return clib_error_return (0, "usage: dp-log enable|disable");
+    return clib_error_return (0, "usage: dp-log enable|disable|dns off|blocked|all");
 
   vlib_cli_output (vm, "dp-log %s", dp_log_is_enabled () ? "enabled" : "disabled");
   return 0;
@@ -24,14 +57,17 @@ dp_log_cli_enable_disable (vlib_main_t *vm, unformat_input_t *input, vlib_cli_co
 
 VLIB_CLI_COMMAND (dp_log_enable_disable_cmd, static) = {
   .path = "dp-log",
-  .short_help = "dp-log enable|disable",
+  .short_help = "dp-log enable|disable | dp-log dns off|blocked|all",
   .function = dp_log_cli_enable_disable,
 };
 
 static clib_error_t *
 dp_log_cli_show (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
-  vlib_cli_output (vm, "dp-log: %s", dp_log_is_enabled () ? "enabled" : "disabled");
+  vlib_cli_output (vm, "dp-log:     %s",
+		   dp_log_is_enabled () ? "enabled" : "disabled");
+  vlib_cli_output (vm, "dp-log dns: %s",
+		   dp_log_dns_mode_name (dp_log_dns_mode_get ()));
   return 0;
 }
 

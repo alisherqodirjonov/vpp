@@ -44,6 +44,14 @@ typedef struct
   ip_address_t address;
 } dns_resolve_name_t;
 
+/** One "clients in this prefix get this block page address" rule. */
+typedef struct
+{
+  ip4_address_t network;  /**< already masked */
+  ip4_address_t address;  /**< block page address for this prefix */
+  u8 mask_len;		  /**< 0..32 */
+} dns_block_redirect_t;
+
 typedef enum
 {
   DNS_API_PENDING_NAME_TO_IP = 1,
@@ -89,6 +97,25 @@ typedef struct
 
 #define DNS_RETRIES_PER_SERVER 3
 
+/**
+ * Cap on client requests parked against one unresolved cache entry.
+ *
+ * While an entry is pending, every client query for that name parks a
+ * request here and gets no reply, so the client retries -- parking another
+ * one. An upstream that is slow (or unreachable) therefore lets this vector
+ * grow without bound, and the moment resolution finally lands the resolver
+ * replays every parked request at once: one UDP reply and one query-log row
+ * each. That was producing hourly bursts of ~1000 identical rows.
+ *
+ * The bound is sized for real fan-out -- many distinct clients asking for
+ * the same uncached name at once -- not for one client's retransmits.
+ * Paired with the bounded retry in retry_scan (an entry no longer stays
+ * pending for an hour), the vector normally holds a couple of entries and
+ * this is only a ceiling. A dropped request costs nothing: that client
+ * retries a second later and by then the name is cached.
+ */
+#define DNS_MAX_PENDING_REQUESTS 64
+
 #define DNS_RESOLVER_EVENT_RESOLVED	1
 #define DNS_RESOLVER_EVENT_PENDING	2
 
@@ -115,6 +142,17 @@ typedef struct
   /** upstream name servers, e.g. 8.8.8.8 */
   ip4_address_t *ip4_name_servers;
   ip6_address_t *ip6_name_servers;
+
+  /** Per-client-subnet block page addresses.
+   *
+   * A static (block) cache entry holds one address, but a box with several
+   * LANs needs each client sent to the block page on ITS OWN segment --
+   * answering a DMZ client with the LAN gateway works only if the two are
+   * routed to each other, and shows the wrong source address when they are.
+   * When this vector is non-empty, the answer for a static entry is
+   * rewritten to the longest-prefix match on the client's address; clients
+   * matching nothing keep the address stored on the entry. */
+  dns_block_redirect_t *block_redirects;
 
   /** resolver process node index */
   u32 resolver_process_node_index;
@@ -202,6 +240,24 @@ u8 *vnet_dns_labels_to_name (u8 * label, u8 * full_text,
 			     u8 ** parse_from_here);
 
 void vnet_dns_create_resolver_process (vlib_main_t * vm, dns_main_t * dm);
+
+void dns_normalize_name (u8 * name);
+
+void dns_log_query (u32 thread_index, u8 * name, int client_is_ip6,
+		    const void *client_addr, dns_cache_entry_t * ep);
+
+int dns_block_redirect_add_del (dns_main_t * dm, ip4_address_t * prefix,
+				u8 mask_len, ip4_address_t * address,
+				int is_add);
+void dns_block_redirect_flush (dns_main_t * dm);
+int dns_block_redirect_lookup (dns_main_t * dm, const void *client_addr,
+			       ip4_address_t * result);
+
+int vnet_dns_response_to_reply (u8 * response, dns_resolve_name_t * rn,
+				u32 * min_ttlp);
+
+u8 *dns_build_static_reply (u8 * name, ip4_address_t * a4,
+			    ip6_address_t * a6);
 
 format_function_t format_dns_reply;
 

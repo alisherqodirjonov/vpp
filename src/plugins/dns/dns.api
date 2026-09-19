@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-option version = "1.0.0";
+option version = "1.2.0";
 
 /** \brief enable/disable name resolution
 
@@ -43,6 +43,72 @@ autoreply define dns_name_server_add_del {
     u8 is_add;
     u8 server_address[16];
     option vat_help = "<ip-address> [del]";
+};
+
+/** \brief add or delete a static DNS cache entry
+
+    Static entries never expire and are answered directly from the
+    dataplane, so they override whatever an upstream server would say.
+    Pointing a name at a local web server is how a "blocked domain"
+    is redirected to a block page.
+
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param is_add - add = 1, delete = 0
+    @param ip4_set - the ip4_address field is valid
+    @param ip6_set - the ip6_address field is valid
+    @param ip4_address - A record to return for the name
+    @param ip6_address - AAAA record to return for the name
+    @param name - the name to add or delete
+*/
+autoreply define dns_cache_add_del {
+    u32 client_index;
+    u32 context;
+    u8 is_add;
+    u8 ip4_set;
+    u8 ip6_set;
+    u8 ip4_address[4];
+    u8 ip6_address[16];
+    u8 name[256];
+    option vat_help = "<name> [<ip4-address>] [<ip6-address>] [del]";
+};
+
+/** \brief flush the entire DNS cache, including static entries
+
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+*/
+autoreply define dns_cache_clear {
+    u32 client_index;
+    u32 context;
+    option vat_help = "";
+};
+
+/** \brief set the block page address used for one client subnet
+
+    A static cache entry carries a single address, but a box with several
+    LANs needs each client sent to the block page on ITS OWN segment. When
+    any rule is present, the answer for a blocked name is rewritten to the
+    longest-prefix match on the client's address; clients matching no rule
+    keep the address stored on the entry.
+
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param is_add - add/replace = 1, delete = 0
+    @param flush - remove every rule; all other fields are ignored
+    @param prefix_len - client prefix length, 0..32
+    @param prefix - client prefix
+    @param address - block page address to answer these clients with
+*/
+autoreply define dns_block_redirect_add_del {
+    u32 client_index;
+    u32 context;
+    u8 is_add;
+    u8 flush;
+    u8 prefix_len;
+    u8 prefix[4];
+    u8 address[4];
+    option vat_help = "<prefix>/<len> <block-address> [del] | flush";
 };
 
 /** \brief DNS name resolution request

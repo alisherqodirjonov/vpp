@@ -812,12 +812,26 @@ nat44_set_tcp_session_state_o2i (snat_main_t *sm, f64 now, snat_session_t *ses,
 
 always_inline void
 nat44_session_update_counters (snat_session_t *s, f64 now, uword bytes,
-			       u32 thread_index)
+			       u32 thread_index, nat44_ed_dir_e dir)
 {
   // regardless of TCP state, reset the timer if data packet is seen.
   s->last_heard = now;
   s->total_pkts++;
   s->total_bytes += bytes;
+
+  /* Keep the direction apart as well. Every caller already knows which way
+   * the packet is going -- it is in2out.c or out2in.c that calls -- and this
+   * is the only place the information still exists. */
+  if (NAT44_ED_DIR_I2O == dir)
+    {
+      s->i2o_pkts++;
+      s->i2o_bytes += bytes;
+    }
+  else
+    {
+      s->o2i_pkts++;
+      s->o2i_bytes += bytes;
+    }
 }
 
 /** \brief Per-user LRU list maintenance */
