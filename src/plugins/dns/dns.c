@@ -14,6 +14,7 @@
  */
 
 #include <vnet/vnet.h>
+#include <vlib/stats/stats.h>
 #include <vnet/udp/udp_local.h>
 #include <vnet/plugin/plugin.h>
 #include <dns/dns.h>
@@ -54,6 +55,12 @@ dns_terminate_c_string (u8 **v)
   clib_mem_unpoison (vec_end (*v), 1);
 }
 
+static inline void
+dns_stats_entries (dns_main_t *dm)
+{
+  vlib_stats_set_gauge (dm->cache_entries_idx, pool_elts (dm->entries));
+}
+
 static int
 dns_cache_clear (dns_main_t * dm)
 {
@@ -71,6 +78,7 @@ dns_cache_clear (dns_main_t * dm)
   }
 
   pool_free (dm->entries);
+  dns_stats_entries (dm);
   hash_free (dm->cache_entry_by_name);
   dm->cache_entry_by_name = hash_create_string (0, sizeof (uword));
   vec_free (dm->unresolved_entries);
@@ -617,6 +625,7 @@ found:
   vec_free (ep->name);
   vec_free (ep->pending_requests);
   pool_put (dm->entries, ep);
+  dns_stats_entries (dm);
 
   return 0;
 }
@@ -738,6 +747,7 @@ dns_add_static_entry (dns_main_t * dm, u8 * name, u8 * dns_reply_data)
   hash_set_mem (dm->cache_entry_by_name, ep->name, ep - dm->entries);
   ep->flags = DNS_CACHE_ENTRY_FLAG_VALID | DNS_CACHE_ENTRY_FLAG_STATIC;
   ep->dns_response = dns_reply_data;
+  dns_stats_entries (dm);
 
   dns_cache_unlock (dm);
   return 0;
@@ -831,6 +841,7 @@ search_again:
 	      goto search_again;
 	    }
 	  *retp = ep;
+	  vlib_stats_set_gauge (dm->cache_hits_idx, ++dm->cache_hits);
 	  dns_cache_unlock (dm);
 	  return (0);
 	}
@@ -858,6 +869,7 @@ search_again:
     }
 
 re_resolve:
+  vlib_stats_set_gauge (dm->cache_misses_idx, ++dm->cache_misses);
   if (pool_elts (dm->entries) == dm->name_cache_size)
     {
       /* Will only fail if the cache is totally filled w/ static entries... */
@@ -877,6 +889,7 @@ re_resolve:
   dns_terminate_c_string (&ep->name);
 
   hash_set_mem (dm->cache_entry_by_name, ep->name, ep - dm->entries);
+  dns_stats_entries (dm);
 
   vec_add1 (dm->unresolved_entries, ep - dm->entries);
   vec_add2 (ep->pending_requests, pr, 1);
@@ -1056,6 +1069,7 @@ found_last_request:
 
   hash_set_mem (dm->cache_entry_by_name, next_ep->name,
 		next_ep - dm->entries);
+  dns_stats_entries (dm);
 
   /* Use the same server */
   next_ep->server_rotor = ep->server_rotor;
@@ -1529,7 +1543,12 @@ dns_config_fn (vlib_main_t * vm, unformat_input_t * input)
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (input, "max-cache-size %u", &dm->name_cache_size))
-	;
+	{
+	  /* INIT may not have registered the gauge yet; dns_init publishes
+	     whatever name_cache_size we stored. */
+	  if (dm->cache_limit_idx)
+	    vlib_stats_set_gauge (dm->cache_limit_idx, dm->name_cache_size);
+	}
       else if (unformat (input, "max-ttl %u", &dm->max_ttl_in_seconds))
 	;
       else
@@ -3408,6 +3427,12 @@ dns_init (vlib_main_t * vm)
   dm->max_ttl_in_seconds = 86400;
   dm->random_seed = 0xDEADDABE;
   dm->api_main = vlibapi_get_main ();
+
+  dm->cache_entries_idx = vlib_stats_add_gauge ("/dns/cache/entries");
+  dm->cache_limit_idx = vlib_stats_add_gauge ("/dns/cache/limit");
+  dm->cache_hits_idx = vlib_stats_add_gauge ("/dns/cache/hits");
+  dm->cache_misses_idx = vlib_stats_add_gauge ("/dns/cache/misses");
+  vlib_stats_set_gauge (dm->cache_limit_idx, dm->name_cache_size);
 
   /* Ask for a correctly-sized block of API message decode slots */
   dm->msg_id_base = setup_message_id_table ();
