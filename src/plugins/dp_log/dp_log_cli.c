@@ -44,12 +44,50 @@ dp_log_cli_enable_disable (vlib_main_t *vm, unformat_input_t *input, vlib_cli_co
       return 0;
     }
 
+  /* "dp-log acl ..." widens or narrows what the ACL log covers beyond the
+     per-rule log flag, which stays the primary control. */
+  if (unformat (input, "acl"))
+    {
+      u8 bit;
+      int on;
+
+      if (unformat (input, "unmatched"))
+	bit = DP_LOG_ACL_F_UNMATCHED;
+      else if (unformat (input, "all-deny"))
+	bit = DP_LOG_ACL_F_ALL_DENY;
+      else
+	return clib_error_return (
+	  0, "usage: dp-log acl unmatched|all-deny on|off");
+
+      if (unformat (input, "on") || unformat (input, "enable"))
+	on = 1;
+      else if (unformat (input, "off") || unformat (input, "disable"))
+	on = 0;
+      else
+	return clib_error_return (
+	  0, "usage: dp-log acl unmatched|all-deny on|off");
+
+      if (on)
+	__atomic_fetch_or (&dp_log_acl_flags, bit, __ATOMIC_RELAXED);
+      else
+	__atomic_fetch_and (&dp_log_acl_flags, (u8) ~bit, __ATOMIC_RELAXED);
+
+      vlib_cli_output (vm, "dp-log acl unmatched %s, all-deny %s",
+		       dp_log_acl_flags_get () & DP_LOG_ACL_F_UNMATCHED ? "on"
+									: "off",
+		       dp_log_acl_flags_get () & DP_LOG_ACL_F_ALL_DENY ? "on"
+								       : "off");
+      return 0;
+    }
+
   if (unformat (input, "enable"))
     __atomic_store_n (&dp_log_enabled, 1, __ATOMIC_RELAXED);
   else if (unformat (input, "disable"))
     __atomic_store_n (&dp_log_enabled, 0, __ATOMIC_RELAXED);
   else
-    return clib_error_return (0, "usage: dp-log enable|disable|dns off|blocked|all");
+    return clib_error_return (
+      0, "usage: dp-log enable|disable | dp-log dns off|blocked|all | "
+	 "dp-log acl unmatched|all-deny on|off");
 
   vlib_cli_output (vm, "dp-log %s", dp_log_is_enabled () ? "enabled" : "disabled");
   return 0;
@@ -57,7 +95,8 @@ dp_log_cli_enable_disable (vlib_main_t *vm, unformat_input_t *input, vlib_cli_co
 
 VLIB_CLI_COMMAND (dp_log_enable_disable_cmd, static) = {
   .path = "dp-log",
-  .short_help = "dp-log enable|disable | dp-log dns off|blocked|all",
+  .short_help = "dp-log enable|disable | dp-log dns off|blocked|all | "
+		"dp-log acl unmatched|all-deny on|off",
   .function = dp_log_cli_enable_disable,
 };
 
@@ -68,6 +107,12 @@ dp_log_cli_show (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *c
 		   dp_log_is_enabled () ? "enabled" : "disabled");
   vlib_cli_output (vm, "dp-log dns: %s",
 		   dp_log_dns_mode_name (dp_log_dns_mode_get ()));
+  vlib_cli_output (vm, "dp-log acl: per-rule flag always, unmatched %s, "
+		       "all-deny %s",
+		   dp_log_acl_flags_get () & DP_LOG_ACL_F_UNMATCHED ? "on"
+								    : "off",
+		   dp_log_acl_flags_get () & DP_LOG_ACL_F_ALL_DENY ? "on"
+								  : "off");
   return 0;
 }
 

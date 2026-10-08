@@ -42,3 +42,14 @@ add_vpp_plugin(acl
   lookup_context.h
   hash_lookup_private.h
 )
+
+# Plugins are dlopen()ed independently and are not linked to each other, so a
+# direct reference to dp_log's symbols compiles and links cleanly and then
+# fails at load time -- taking the whole data plane down with it. Catch it
+# here instead. See src/plugins/dp_log/check-plugin-boundary.sh.
+add_custom_command(TARGET acl_plugin POST_BUILD
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../dp_log/check-plugin-boundary.sh
+          $<TARGET_FILE:acl_plugin> dp_log_
+  COMMENT "Checking acl_plugin does not link against dp_log directly"
+  VERBATIM
+)

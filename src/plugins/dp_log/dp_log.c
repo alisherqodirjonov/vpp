@@ -20,12 +20,13 @@
 /* Forward declaration for internal use */
 static int dp_log_acl_enq (u32 thread_index, const dp_log_acl_event_t *ev);
 static int dp_log_dns_enq (u32 thread_index, const dp_log_dns_event_t *ev);
+static int dp_log_sess_enq (u32 thread_index, const dp_log_sess_event_t *ev);
 
 #include <vpp/app/version.h>
 
 VLIB_PLUGIN_REGISTER () = {
   .version = VPP_BUILD_VER,
-  .description = "dp_log: dataplane ACL deny + DNS query logger",
+  .description = "dp_log: dataplane ACL match, session close and DNS query logger",
 };
 
 DP_LOG_API int
@@ -40,11 +41,18 @@ dp_log_dns_enq_export (u32 thread_index, const dp_log_dns_event_t *ev)
   return dp_log_dns_enq (thread_index, ev);
 }
 
+DP_LOG_API int
+dp_log_sess_enq_export (u32 thread_index, const dp_log_sess_event_t *ev)
+{
+  return dp_log_sess_enq (thread_index, ev);
+}
+
 /* Exported enable flag (fast dataplane read). */
 DP_LOG_API u8 dp_log_enabled = 0;
 
 /* Exported DNS log mode, one of DP_LOG_DNS_*. */
 DP_LOG_API u8 dp_log_dns_mode = DP_LOG_DNS_OFF;
+DP_LOG_API u8 dp_log_acl_flags = 0;
 
 // typedef struct
 // {
@@ -100,6 +108,21 @@ typedef struct
 
 typedef struct
 {
+  u32 size;
+  u32 mask;
+
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline1);
+  u32 head;
+
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline2);
+  u32 tail;
+
+  dp_log_sess_event_t *elts;
+  u64 drops;
+} dp_log_sess_ring_t;
+
+typedef struct
+{
 
   u64 wall_base_ns; /* CLOCK_REALTIME at base (ns) */
   u64 ts_base_ns;   /* clib_time_now() at same base (ns since VPP start) */
@@ -123,11 +146,36 @@ typedef struct
   u32 dns_ring_size;
   dp_log_dns_ring_t *dns_rings;
 
+  /* Session close log: one record per stateful flow, not per packet, so the
+     rate is bounded by connections per second rather than by pps. It shares
+     the ACL file -- one log, one row per event -- so it needs a ring and a
+     size but no descriptor or path of its own. */
+  u32 sess_ring_size;
+  dp_log_sess_ring_t *sess_rings;
+
   pthread_t writer_thread;
   volatile int stop;
 } dp_log_main_t;
 
 static dp_log_main_t dp_log_main;
+
+/* Diagnostics from the writer thread go to stderr, never clib_warning.
+ *
+ * clib_warning () formats through VPP's vector machinery, which allocates
+ * on the per-thread heap -- and this thread has no heap of its own, so it
+ * would use the main thread's unlocked. That is the same fault that took
+ * the data plane down under an hping3 flood; an error path is a worse place
+ * to hide it than the hot path, because it only fires when something is
+ * already wrong. stderr is libc, thread-safe, and lands in the journal. */
+#define dp_log_warn(...)                                                      \
+  do                                                                          \
+    {                                                                         \
+      fprintf (stderr, "dp_log: ");                                           \
+      fprintf (stderr, __VA_ARGS__);                                          \
+      fprintf (stderr, "\n");                                                 \
+    }                                                                         \
+  while (0)
+
 
 /* ----------------------- Ring ops (no locks) ----------------------- */
 
@@ -202,6 +250,40 @@ dp_log_dns_ring_try_deq (dp_log_dns_ring_t *r, dp_log_dns_event_t *out)
   return 1;
 }
 
+static inline uword
+dp_log_sess_ring_try_enq (dp_log_sess_ring_t *r, const dp_log_sess_event_t *ev)
+{
+  u32 head = __atomic_load_n (&r->head, __ATOMIC_RELAXED);
+  u32 tail = __atomic_load_n (&r->tail, __ATOMIC_ACQUIRE);
+  u32 next = (head + 1) & r->mask;
+
+  if (PREDICT_FALSE (next == tail))
+    {
+      __atomic_add_fetch (&r->drops, 1, __ATOMIC_RELAXED);
+      return 0;
+    }
+
+  r->elts[head] = *ev;
+
+  __atomic_store_n (&r->head, next, __ATOMIC_RELEASE);
+  return 1;
+}
+
+static inline uword
+dp_log_sess_ring_try_deq (dp_log_sess_ring_t *r, dp_log_sess_event_t *out)
+{
+  u32 tail = __atomic_load_n (&r->tail, __ATOMIC_RELAXED);
+  u32 head = __atomic_load_n (&r->head, __ATOMIC_ACQUIRE);
+
+  if (tail == head)
+    return 0;
+
+  *out = r->elts[tail];
+
+  __atomic_store_n (&r->tail, (tail + 1) & r->mask, __ATOMIC_RELEASE);
+  return 1;
+}
+
 /* ----------------------- Worker API ----------------------- */
 
 int
@@ -244,6 +326,26 @@ dp_log_dns_enq (u32 thread_index, const dp_log_dns_event_t *ev)
   return (int) dp_log_dns_ring_try_enq (&lm->dns_rings[thread_index], ev);
 }
 
+static int
+dp_log_sess_enq (u32 thread_index, const dp_log_sess_event_t *ev)
+{
+  dp_log_main_t *lm = &dp_log_main;
+
+  /* Follows the ACL master switch: the session log is the volume half of the
+     same picture, and a per-rule flag already decided that this flow is one
+     the operator asked about. */
+  if (PREDICT_FALSE (!dp_log_is_enabled ()))
+    return 0;
+
+  if (PREDICT_FALSE (lm->sess_rings == 0))
+    return 0;
+
+  if (PREDICT_FALSE (thread_index >= lm->n_threads))
+    return 0;
+
+  return (int) dp_log_sess_ring_try_enq (&lm->sess_rings[thread_index], ev);
+}
+
 static inline void
 dp_log_format_wall_time_ms (char *dst, size_t dst_sz, const dp_log_main_t *lm,
 			    u64 ev_ts_ns)
@@ -279,6 +381,44 @@ dp_log_pin_to_core (int core)
   (void) pthread_setaffinity_np (pthread_self (), sizeof (cs), &cs);
 }
 
+/* Close the descriptor if the file it points at is no longer the one at
+ * path, so the next loop reopens it.
+ *
+ * The writer holds every log open with O_APPEND. An operator who deletes or
+ * moves one -- "rm acl_sessions.log" to start clean -- only unlinks the
+ * directory entry: the descriptor stays valid and the writer keeps appending
+ * to an inode nothing can open any more. The log then looks permanently
+ * empty, with no error anywhere, until VPP is restarted. That is a silent
+ * data-loss mode and it is not obvious from the outside, so the writer
+ * checks rather than assumes.
+ *
+ * Two stats per file per second; it is called on the flush tick, never per
+ * record.
+ */
+static void
+dp_log_reopen_if_replaced (int *fd, const u8 *path)
+{
+  struct stat on_disk, open_now;
+
+  if (*fd < 0 || !path || !path[0])
+    return;
+
+  if (fstat (*fd, &open_now) != 0)
+    {
+      close (*fd);
+      *fd = -1;
+      return;
+    }
+
+  if (stat ((const char *) path, &on_disk) != 0 ||
+      on_disk.st_ino != open_now.st_ino || on_disk.st_dev != open_now.st_dev)
+    {
+      /* Deleted, moved, or replaced by a new file at the same path. */
+      close (*fd);
+      *fd = -1;
+    }
+}
+
 static int
 dp_log_open_file (dp_log_main_t *lm)
 {
@@ -303,7 +443,7 @@ dp_log_open_file (dp_log_main_t *lm)
   lm->fd = open (p, O_CREAT | O_WRONLY | O_APPEND, 0644);
   if (lm->fd < 0)
     {
-      clib_warning ("dp_log: open(%s) failed: %s", p, strerror (errno));
+      dp_log_warn ("open(%s) failed: %s", p, strerror (errno));
       return -1;
     }
 
@@ -313,8 +453,16 @@ dp_log_open_file (dp_log_main_t *lm)
   /* Write header only if file is empty (new file) */
   if (file_size == 0)
     {
-      const char *hdr = "ts,is_ip6,proto,sport,dport,sw_if_index,fib_index,"
-			"acl_index,rule_index,action,src,dst,count\n";
+      /* One file, one row per event, with kind saying which kind of event.
+	 Splitting match records and session records into two files was an
+	 implementation detail leaking into the operator's view: nobody asks
+	 "was this a rule evaluation or a flow summary", they ask what
+	 happened. The union is sparse -- a match row has no volume, a
+	 session row has no count -- and empty fields cost a byte each. */
+      const char *hdr =
+	"ts,kind,is_ip6,proto,sport,dport,sw_if_index,fib_index,acl_index,"
+	"rule_index,action,dir,src,dst,count,duration_ms,bytes_in,bytes_out,"
+	"pkts_in,pkts_out\n";
       /*ssize_t hdr_written = */
       (void) write (lm->fd, hdr, (int) strlen (hdr));
       //   clib_warning ("dp_log: wrote header, %ld bytes", hdr_written);
@@ -341,7 +489,7 @@ dp_log_open_dns_file (dp_log_main_t *lm)
   lm->dns_fd = open (p, O_CREAT | O_WRONLY | O_APPEND, 0644);
   if (lm->dns_fd < 0)
     {
-      clib_warning ("dp_log: open(%s) failed: %s", p, strerror (errno));
+      dp_log_warn ("open(%s) failed: %s", p, strerror (errno));
       return -1;
     }
 
@@ -380,6 +528,39 @@ dp_log_copy_dns_name (char *dst, size_t dst_sz, const dp_log_dns_event_t *ev)
   return (int) o;
 }
 
+/* Same formatting for a session record. Kept separate rather than made
+   generic over a union member: the two event types are independent wire
+   formats and quietly coupling them would make a change to one silently
+   reinterpret the other. */
+static inline int
+dp_log_format_sess_ip (char *dst, size_t dst_sz, const dp_log_sess_event_t *ev,
+		       int is_src)
+{
+  if (!dst || dst_sz == 0)
+    return 0;
+
+  if (!ev->is_ip6)
+    {
+      struct in_addr a;
+      if (is_src)
+	clib_memcpy_fast (&a, &ev->ip.v4.src, sizeof (a));
+      else
+	clib_memcpy_fast (&a, &ev->ip.v4.dst, sizeof (a));
+
+      return inet_ntop (AF_INET, &a, dst, (socklen_t) dst_sz) != 0;
+    }
+  else
+    {
+      struct in6_addr a6;
+      if (is_src)
+	clib_memcpy_fast (&a6, &ev->ip.v6.src, sizeof (a6));
+      else
+	clib_memcpy_fast (&a6, &ev->ip.v6.dst, sizeof (a6));
+
+      return inet_ntop (AF_INET6, &a6, dst, (socklen_t) dst_sz) != 0;
+    }
+}
+
 static inline int
 dp_log_format_ip (char *dst, size_t dst_sz, const dp_log_acl_event_t *ev,
 		  int is_src)
@@ -416,19 +597,61 @@ typedef struct
   u32 sport_dport;   /* Combined ports */
   u8 proto;
   u8 is_ip6;
-  u16 _pad;
+  u8 is_input;
+  u8 _pad;
 
   u32 acl_index;
   u32 rule_index;
+  /* Same 5-tuple arriving on two interfaces is two distinct events, not one
+     with a doubled count -- and with permit logging on, that case is normal
+     rather than exotic. */
+  u32 sw_if_index;
 } dp_log_agg_key_t;
 
 /* Aggregated event with count */
 typedef struct
 {
   dp_log_agg_key_t key;
-  u64 count;
+  u64 count; /* 0 means the slot is free */
   dp_log_acl_event_t last_event; /* Keep last event for full logging */
 } dp_log_agg_event_t;
+
+/* Append one ACL match row to the batching buffer, flushing it to disk if
+ * the row would not fit. Shared by the per-second aggregate flush and the
+ * overflow path, so a row written while the table is full looks identical
+ * to one that went through aggregation -- it simply carries count=1. */
+static void
+dp_log_write_acl_row (dp_log_main_t *lm, char *out, int *out_len, int cap,
+		      const dp_log_acl_event_t *ev, u64 count)
+{
+  char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN], ts[32], line[512];
+  int len;
+
+  if (!dp_log_format_ip (src, sizeof (src), ev, 1))
+    clib_strncpy (src, "?", sizeof (src));
+  if (!dp_log_format_ip (dst, sizeof (dst), ev, 0))
+    clib_strncpy (dst, "?", sizeof (dst));
+  dp_log_format_wall_time_ms (ts, sizeof (ts), lm, ev->ts_ns);
+
+  len = snprintf (line, sizeof (line),
+		  "%s,match,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s,%llu,,,,,\n",
+		  ts, (unsigned) ev->is_ip6, (unsigned) ev->proto,
+		  (unsigned) ev->sport, (unsigned) ev->dport,
+		  (unsigned) ev->sw_if_index, (unsigned) ev->fib_index,
+		  (unsigned) ev->acl_index, (unsigned) ev->rule_index,
+		  (unsigned) ev->action, ev->is_input ? "in" : "out", src, dst,
+		  (unsigned long long) count);
+  if (len <= 0)
+    return;
+
+  if (*out_len + len > cap)
+    {
+      (void) write (lm->fd, out, *out_len);
+      *out_len = 0;
+    }
+  clib_memcpy_fast (out + *out_len, line, len);
+  *out_len += len;
+}
 
 static void *
 dp_log_writer_thread_fn (void *arg)
@@ -437,23 +660,50 @@ dp_log_writer_thread_fn (void *arg)
 
   dp_log_pin_to_core (lm->writer_core);
 
-  /* Big batching buffer: one write() per chunk */
+  /* Big batching buffer: one write() per chunk.
+   *
+   * malloc, not clib_mem_alloc. This is a plain pthread, not a VPP worker,
+   * so os_get_thread_index () answers 0 for it and every clib_mem call here
+   * would operate on the MAIN thread's heap with no lock. That raced
+   * harmlessly for months because a quiet box produces few distinct flows
+   * per second and the aggregation table almost never grew -- and then an
+   * hping3 flood produced thousands, hash_set called clib_mem_realloc
+   * concurrently with the main thread, and VPP died in the allocator.
+   * Nothing in this thread may touch the VPP heap. */
   enum
   {
     OUTBUF_SZ = 1 << 20
   }; /* 1MB */
-  char *out = clib_mem_alloc (OUTBUF_SZ);
+  char *out = malloc (OUTBUF_SZ);
   int out_len = 0;
 
-  /* Aggregation: hash table for counting events per second */
-  uword *agg_hash =
-    0; /* hash table: key = fingerprint, value = ptr to dp_log_agg_event_t */
-  dp_log_agg_event_t *agg_events = 0;
+  /* Aggregation table: open-addressed, power-of-two, allocated once.
+   *
+   * Fixed capacity on purpose. A log aggregator must not grow without bound
+   * while being flooded -- that is precisely when it must stay cheap and
+   * predictable. When the table fills, events are written through
+   * unaggregated rather than dropped, so a flood costs disk rather than
+   * visibility. */
+  enum
+  {
+    AGG_CAP = 1 << 13
+  }; /* 8192 distinct flows per second before falling through */
+  dp_log_agg_event_t *agg_slots = calloc (AGG_CAP, sizeof (*agg_slots));
   u32 agg_count = 0;
+  u64 overflow_events = 0;
+
+  if (!out || !agg_slots)
+    {
+      dp_log_warn ("writer thread could not allocate; logging off");
+      free (out);
+      free (agg_slots);
+      return 0;
+    }
 
   /* Flush pacing */
   struct timespec last_flush;
   clock_gettime (CLOCK_MONOTONIC, &last_flush);
+  struct timespec last_stat = last_flush;
   enum
   {
     FLUSH_INTERVAL_MS = 1000
@@ -469,6 +719,21 @@ dp_log_writer_thread_fn (void *arg)
 	 EITHER is on and drains only the rings that are actually enabled. */
       int acl_on = dp_log_is_enabled ();
       int dns_on = dp_log_dns_mode_get () != DP_LOG_DNS_OFF;
+
+      /* Once a second, notice if any of our files was deleted or replaced
+	 under us and drop the stale descriptor; the opens below recreate it. */
+      {
+	struct timespec tnow;
+	clock_gettime (CLOCK_MONOTONIC, &tnow);
+	long since_ms = (tnow.tv_sec - last_stat.tv_sec) * 1000L +
+			(tnow.tv_nsec - last_stat.tv_nsec) / 1000000L;
+	if (since_ms >= 1000)
+	  {
+	    dp_log_reopen_if_replaced (&lm->fd, lm->path);
+	    dp_log_reopen_if_replaced (&lm->dns_fd, lm->dns_path);
+	    last_stat = tnow;
+	  }
+      }
 
       if (!acl_on && !dns_on)
 	{
@@ -503,10 +768,85 @@ dp_log_writer_thread_fn (void *arg)
 	    }
 	}
 
+      /* Session records go to the same file as match records -- one log,
+	 one row per event, told apart by the kind column. */
+      int sess_on = acl_on;
+
       if (!acl_on && !dns_on)
 	continue;
 
       int did_work = 0;
+
+      /* ---- Session closes: one row per flow, written straight through.
+	 No aggregation: each record is already a whole flow, and collapsing
+	 two of them would destroy the volume figure they exist to carry. */
+      if (sess_on)
+	{
+	  char sess_out[8192];
+	  int sess_len = 0;
+
+	  for (u32 ti = 0; ti < lm->n_threads; ti++)
+	    {
+	      dp_log_sess_ring_t *r = &lm->sess_rings[ti];
+	      dp_log_sess_event_t ev;
+	      int n = 0;
+
+	      while (n < 1024 && dp_log_sess_ring_try_deq (r, &ev))
+		{
+		  char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
+		  char ts[32];
+		  char line[512];
+
+		  did_work = 1;
+		  n++;
+
+		  if (!dp_log_format_sess_ip (src, sizeof (src), &ev, 1))
+		    clib_strncpy (src, "?", sizeof (src));
+		  if (!dp_log_format_sess_ip (dst, sizeof (dst), &ev, 0))
+		    clib_strncpy (dst, "?", sizeof (dst));
+		  dp_log_format_wall_time_ms (ts, sizeof (ts), lm, ev.ts_ns);
+
+		  /* Milliseconds with three decimals rather than a whole
+		     number. A LAN exchange that opens and closes inside one
+		     millisecond is normal -- an hping3 SYN/RST pair takes
+		     microseconds -- and rounding those to "0" threw away the
+		     only timing the record carried. Keeping the unit and
+		     adding precision means rows written before this change
+		     still read correctly as whole milliseconds. */
+		  /* Same columns as a match row, filled from the other end:
+		     no count, but a duration and the volume each way. action
+		     is always permit+reflect, because that is the only verdict
+		     that creates a session. */
+		  int len = snprintf (
+		    line, sizeof (line),
+		    "%s,%s,%u,%u,%u,%u,%u,0,%u,%u,2,%s,%s,%s,,%.3f,%llu,%llu,"
+		    "%u,%u\n",
+		    ts,
+		    ev.kind == DP_LOG_SESS_CLOSE ? "close" : "open",
+		    (unsigned) ev.is_ip6, (unsigned) ev.proto,
+		    (unsigned) ev.sport, (unsigned) ev.dport,
+		    (unsigned) ev.sw_if_index, (unsigned) ev.acl_index,
+		    (unsigned) ev.rule_index, ev.is_input ? "in" : "out", src,
+		    dst, (double) ev.duration_ns / 1e6,
+		    (unsigned long long) ev.bytes[1],
+		    (unsigned long long) ev.bytes[0], (unsigned) ev.packets[1],
+		    (unsigned) ev.packets[0]);
+		  if (len <= 0)
+		    continue;
+
+		  if (sess_len + len > (int) sizeof (sess_out))
+		    {
+		      (void) write (lm->fd, sess_out, sess_len);
+		      sess_len = 0;
+		    }
+		  clib_memcpy_fast (sess_out + sess_len, line, len);
+		  sess_len += len;
+		}
+	    }
+
+	  if (sess_len > 0)
+	    (void) write (lm->fd, sess_out, sess_len);
+	}
 
       /* ---- DNS queries: written straight through, no aggregation ---- */
       if (dns_on)
@@ -613,6 +953,8 @@ dp_log_writer_thread_fn (void *arg)
 	      key.is_ip6 = ev.is_ip6;
 	      key.acl_index = ev.acl_index;
 	      key.rule_index = ev.rule_index;
+	      key.sw_if_index = ev.sw_if_index;
+	      key.is_input = ev.is_input;
 
 	      if (!ev.is_ip6)
 		{
@@ -631,22 +973,39 @@ dp_log_writer_thread_fn (void *arg)
 	      for (u32 j = 0; j < sizeof (key); j++)
 		hash_val = ((hash_val << 5) + hash_val) + ptr[j];
 
-	      /* Look up in aggregation hash */
-	      uword *p = hash_get (agg_hash, hash_val);
+	      /* Linear probe. The table is never more than half full before
+		 the overflow path below takes over, so the probe is short. */
 	      dp_log_agg_event_t *agg_event = 0;
-
-	      if (p)
+	      u32 slot = (u32) (hash_val & (AGG_CAP - 1));
+	      for (u32 probe = 0; probe < AGG_CAP; probe++)
 		{
-		  agg_event = (dp_log_agg_event_t *) (*p);
+		  dp_log_agg_event_t *cand =
+		    &agg_slots[(slot + probe) & (AGG_CAP - 1)];
+		  if (cand->count == 0)
+		    {
+		      /* Free slot: claim it, unless the table is already
+			 carrying as much as it should. */
+		      if (agg_count >= AGG_CAP / 2)
+			break;
+		      cand->key = key;
+		      agg_count++;
+		      agg_event = cand;
+		      break;
+		    }
+		  if (0 == memcmp (&cand->key, &key, sizeof (key)))
+		    {
+		      agg_event = cand;
+		      break;
+		    }
 		}
-	      else
+
+	      if (PREDICT_FALSE (agg_event == 0))
 		{
-		  /* New event - add to aggregation */
-		  vec_add2 (agg_events, agg_event, 1);
-		  agg_event->key = key;
-		  agg_event->count = 0;
-		  hash_set (agg_hash, hash_val, (uword) agg_event);
-		  agg_count++;
+		  /* Overflowing: write this one through on its own rather
+		     than lose it. A flood should cost disk, not visibility. */
+		  overflow_events++;
+		  dp_log_write_acl_row (lm, out, &out_len, OUTBUF_SZ, &ev, 1);
+		  continue;
 		}
 
 	      agg_event->count++;
@@ -663,46 +1022,13 @@ dp_log_writer_thread_fn (void *arg)
 
       if (dt_ms >= FLUSH_INTERVAL_MS && agg_count > 0)
 	{
-	  /* Write all aggregated events */
-	  for (u32 i = 0; i < vec_len (agg_events); i++)
+	  for (u32 i = 0; i < AGG_CAP; i++)
 	    {
-	      dp_log_agg_event_t *agg = &agg_events[i];
-	      dp_log_acl_event_t *ev = &agg->last_event;
-
-	      char src[INET6_ADDRSTRLEN];
-	      char dst[INET6_ADDRSTRLEN];
-	      if (!dp_log_format_ip (src, sizeof (src), ev, 1))
-		clib_strncpy (src, "?", sizeof (src));
-	      if (!dp_log_format_ip (dst, sizeof (dst), ev, 0))
-		clib_strncpy (dst, "?", sizeof (dst));
-
-	      /* CSV line with count */
-	      char ts[32];
-	      dp_log_format_wall_time_ms (ts, sizeof (ts), lm, ev->ts_ns);
-
-	      char line[512];
-	      int len =
-		snprintf (line, sizeof (line),
-			  "%s,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%llu\n", ts,
-			  (unsigned) ev->is_ip6, (unsigned) ev->proto,
-			  (unsigned) ev->sport, (unsigned) ev->dport,
-			  (unsigned) ev->sw_if_index, (unsigned) ev->fib_index,
-			  (unsigned) ev->acl_index, (unsigned) ev->rule_index,
-			  (unsigned) ev->action, src, dst,
-			  (unsigned long long) agg->count);
-
-	      if (len <= 0)
+	      if (agg_slots[i].count == 0)
 		continue;
-
-	      /* If buffer would overflow, flush first */
-	      if (out_len + len > OUTBUF_SZ)
-		{
-		  (void) write (lm->fd, out, out_len);
-		  out_len = 0;
-		}
-
-	      clib_memcpy_fast (out + out_len, line, len);
-	      out_len += len;
+	      dp_log_write_acl_row (lm, out, &out_len, OUTBUF_SZ,
+				    &agg_slots[i].last_event,
+				    agg_slots[i].count);
 	    }
 
 	  /* Flush buffer */
@@ -712,15 +1038,22 @@ dp_log_writer_thread_fn (void *arg)
 	      out_len = 0;
 	    }
 
-	  /* Clear aggregation for next window */
-	  hash_free (agg_hash);
-	  agg_hash = 0;
-	  vec_free (agg_events);
+	  if (overflow_events)
+	    {
+	      dp_log_warn ("%llu ACL events in the last window exceeded the "
+			   "%u-flow aggregation table and were written "
+			   "individually",
+			   (unsigned long long) overflow_events,
+			   (unsigned) (AGG_CAP / 2));
+	      overflow_events = 0;
+	    }
+
+	  /* Clear the window. memset, not free: the table is allocated once
+	     for the life of the thread. */
+	  memset (agg_slots, 0, AGG_CAP * sizeof (*agg_slots));
 	  agg_count = 0;
 
 	  last_flush = now;
-	  //   clib_warning ("dp_log: flushed %ld aggregated results at %ld ms
-	  //   interval", vec_len(agg_events), dt_ms);
 	}
 
       if (!did_work)
@@ -732,9 +1065,8 @@ dp_log_writer_thread_fn (void *arg)
     (void) write (lm->fd, out, out_len);
 
   /* Clean up */
-  hash_free (agg_hash);
-  vec_free (agg_events);
-  clib_mem_free (out);
+  free (agg_slots);
+  free (out);
   return 0;
 }
 
@@ -783,10 +1115,18 @@ dp_log_config (vlib_main_t *vm, unformat_input_t *input)
 	{
 	  //   clib_warning ("dp_log_config: path=%s", (char *)lm->path);
 	}
+      else if (unformat (input, "session-ring-size %u", &lm->sess_ring_size))
+	;
       else if (unformat (input, "dns-path %s", &lm->dns_path))
 	;
       else if (unformat (input, "dns-ring-size %u", &lm->dns_ring_size))
 	;
+      else if (unformat (input, "acl-log-unmatched"))
+	__atomic_fetch_or (&dp_log_acl_flags, DP_LOG_ACL_F_UNMATCHED,
+			   __ATOMIC_RELAXED);
+      else if (unformat (input, "acl-log-all-deny"))
+	__atomic_fetch_or (&dp_log_acl_flags, DP_LOG_ACL_F_ALL_DENY,
+			   __ATOMIC_RELAXED);
       else if (unformat (input, "dns-log-all"))
 	__atomic_store_n (&dp_log_dns_mode, DP_LOG_DNS_ALL, __ATOMIC_RELAXED);
       else if (unformat (input, "dns-log-blocked"))
@@ -822,6 +1162,10 @@ dp_log_init (vlib_main_t *vm)
   /* 2048 entries x ~300 bytes x n_threads. Sizing this like the ACL ring
      (65536) would reserve hundreds of MB to buffer a few queries a second. */
   lm->dns_ring_size = dp_log_pow2_or_default (lm->dns_ring_size, 1 << 11);
+  /* One record per flow rather than per packet, so the arrival rate is
+     connections per second. 4096 absorbs a burst of short-lived connections
+     without reserving the ACL ring's footprint. */
+  lm->sess_ring_size = dp_log_pow2_or_default (lm->sess_ring_size, 1 << 12);
   lm->writer_core =
     (lm->writer_core == 0 && lm->writer_core == 0) ? -1 : lm->writer_core;
   /* (above line effectively keeps default -1 if not set; harmless) */
@@ -861,6 +1205,25 @@ dp_log_init (vlib_main_t *vm)
       r->elts = clib_mem_alloc_aligned (r->size * sizeof (dp_log_acl_event_t),
 					CLIB_CACHE_LINE_BYTES);
       clib_memset (r->elts, 0, r->size * sizeof (dp_log_acl_event_t));
+
+      __atomic_store_n (&r->head, 0, __ATOMIC_RELAXED);
+      __atomic_store_n (&r->tail, 0, __ATOMIC_RELAXED);
+      __atomic_store_n (&r->drops, 0, __ATOMIC_RELAXED);
+    }
+
+  lm->sess_rings = clib_mem_alloc_aligned (
+    sizeof (*lm->sess_rings) * lm->n_threads, CLIB_CACHE_LINE_BYTES);
+  clib_memset (lm->sess_rings, 0, sizeof (*lm->sess_rings) * lm->n_threads);
+
+  for (u32 i = 0; i < lm->n_threads; i++)
+    {
+      dp_log_sess_ring_t *r = &lm->sess_rings[i];
+      r->size = lm->sess_ring_size;
+      r->mask = r->size - 1;
+
+      r->elts = clib_mem_alloc_aligned (
+	r->size * sizeof (dp_log_sess_event_t), CLIB_CACHE_LINE_BYTES);
+      clib_memset (r->elts, 0, r->size * sizeof (dp_log_sess_event_t));
 
       __atomic_store_n (&r->head, 0, __ATOMIC_RELAXED);
       __atomic_store_n (&r->tail, 0, __ATOMIC_RELAXED);

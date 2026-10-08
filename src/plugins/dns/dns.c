@@ -1653,31 +1653,10 @@ dns_block_redirect_lookup (dns_main_t * dm, const void *client_addr,
  * unchanged when dp_log_plugin.so is not loaded.
  * ------------------------------------------------------------------------ */
 
-typedef int (*dns_dp_log_enq_fn_t) (u32, const dp_log_dns_event_t *);
-static dns_dp_log_enq_fn_t dns_dp_log_enq_fp;
-static u8 *dns_dp_log_mode_p;
-static int dns_dp_log_resolved;
-
-static void
-dns_dp_log_resolve_once (void)
-{
-  if (PREDICT_TRUE (dns_dp_log_resolved))
-    return;
-
-  dns_dp_log_resolved = 1;
-
-  dns_dp_log_enq_fp = (dns_dp_log_enq_fn_t) vlib_get_plugin_symbol (
-    "dp_log_plugin.so", "dp_log_dns_enq_export");
-  dns_dp_log_mode_p =
-    (u8 *) vlib_get_plugin_symbol ("dp_log_plugin.so", "dp_log_dns_mode");
-
-  if (dns_dp_log_enq_fp == 0 || dns_dp_log_mode_p == 0)
-    {
-      dns_dp_log_enq_fp = 0;
-      clib_warning ("dns: query logging unavailable (dp_log_plugin.so not "
-		    "loaded or symbols missing)");
-    }
-}
+/* dp_log lives in another plugin; reached through the resolved handle from
+ * dp_log.h rather than by naming its symbols. See the boundary note there --
+ * a direct reference is an undefined symbol that stops VPP from starting. */
+static dp_log_client_t dns_dp_log;
 
 /**
  * Record one answered query: who asked, what they asked for, and what we
@@ -1700,11 +1679,11 @@ dns_log_query (u32 thread_index, u8 *name, int client_is_ip6,
   int blocked, mode;
   u32 name_len;
 
-  dns_dp_log_resolve_once ();
-  if (dns_dp_log_enq_fp == 0)
-    return;
+  dp_log_client_resolve (&dns_dp_log);
 
-  mode = __atomic_load_n (dns_dp_log_mode_p, __ATOMIC_RELAXED);
+  /* DP_LOG_DNS_OFF when dp_log is absent, so this one check covers both
+     "logging is off" and "the logger is not loaded". */
+  mode = dp_log_client_dns_mode (&dns_dp_log);
   if (mode == DP_LOG_DNS_OFF)
     return;
 
@@ -1765,7 +1744,7 @@ dns_log_query (u32 thread_index, u8 *name, int client_is_ip6,
 	}
     }
 
-  (void) dns_dp_log_enq_fp (thread_index, &ev);
+  (void) dp_log_client_dns_enq (&dns_dp_log, thread_index, &ev);
 }
 
 /**

@@ -47,6 +47,12 @@ static u8 icmp_protos[] = { IP_PROTOCOL_ICMP, IP_PROTOCOL_ICMP6 };
 
 
 
+/* For DP_LOG_SESS_* -- the session records emitted from here are described
+   by dp_log's wire format, so the kind constants come from the same header
+   that defines the event. This pulls in only dp_log.h's client half; see
+   the boundary note there. */
+#include <dp_log/dp_log.h>
+
 always_inline int
 acl_fa_ifc_has_sessions (acl_main_t * am, int sw_if_index0)
 {
@@ -274,12 +280,35 @@ is_ip6_5tuple (fa_5tuple_t * p5t)
 	  l3_zero_pad[4] | p5t->l3_zero_pad[5]) != 0;
 }
 
+/* Has this TCP conversation finished?
+ *
+ * Either end sending RST ends it outright; a graceful close needs FIN from
+ * both directions. Anything less is still in flight. */
+always_inline int
+acl_fa_tcp_session_is_closed (fa_session_t * sess)
+{
+  u8 a = sess->tcp_flags_seen.as_u8[0];
+  u8 b = sess->tcp_flags_seen.as_u8[1];
+
+  if ((a | b) & TCP_FLAG_RST)
+    return 1;
+  return (a & TCP_FLAG_FIN) && (b & TCP_FLAG_FIN);
+}
+
 always_inline u8
 acl_fa_track_session (acl_main_t * am, int is_input, u32 sw_if_index, u64 now,
 		      fa_session_t * sess, fa_5tuple_t * pkt_5tuple,
 		      u32 pkt_len)
 {
   sess->last_active_time = now;
+  /* The only point in the plugin every packet of a stateful flow passes
+     through. pkt_len arrived here already and used to be discarded; without
+     these two adds there is nowhere to learn how much traffic a permitted
+     flow carried, because the rule that permitted it is never evaluated
+     again. Unconditional rather than gated on the log flag: a branch here
+     costs more than the adds, and both cache lines are already resident. */
+  sess->total_bytes[is_input] += pkt_len;
+  sess->total_packets[is_input]++;
   u8 old_flags = sess->tcp_flags_seen.as_u8[is_input];
   u8 new_flags = old_flags | pkt_5tuple->pkt.tcp_flags;
 
@@ -288,6 +317,67 @@ acl_fa_track_session (acl_main_t * am, int is_input, u32 sw_if_index, u64 now,
   if (PREDICT_FALSE (flags_need_update))
     {
       sess->tcp_flags_seen.as_u8[is_input] = new_flags;
+
+      /* Write the record when the conversation ends, not when the session
+	 is eventually reaped.
+	 *
+	 * Waiting for the timeout is what a session table needs, not what a
+	 * log reader needs: a closed TCP flow sits in the transient list for
+	 * TCP_SESSION_TRANSIENT_TIMEOUT_SEC (120) and an idle established
+	 * one for TCP_SESSION_IDLE_TIMEOUT_SEC (a full day) before anything
+	 * is written. Nobody can operate a firewall whose traffic log is a
+	 * day behind.
+	 *
+	 * The cost is the handful of packets that may follow the last FIN --
+	 * the final ACK, a retransmit -- which land after the totals were
+	 * read. Undercounting a closed flow by a few frames is a far smaller
+	 * error than reporting it 24 hours late. */
+      if (PREDICT_FALSE (sess->log && !sess->logged &&
+			 sess->info.l4.proto == IPPROTO_TCP &&
+			 acl_fa_tcp_session_is_closed (sess)))
+	{
+	  sess->logged = 1;
+	  acl_log_session (sess, sw_if_index, DP_LOG_SESS_CLOSE);
+	}
+    }
+
+  /* ---- interim record ------------------------------------------------
+   *
+   * A flow that lasts reports as it goes, instead of staying invisible
+   * until it ends. Without this a download in progress shows nothing, an
+   * idle TCP session nothing for a day, and a reused 5-tuple -- which is
+   * what a port-cycling flood produces -- is counted into a record that
+   * was written and frozen long before.
+   *
+   * The deadline is derived rather than stored: there is no room in the
+   * session for an 8-byte timestamp, but (interim_n + 1) * interval
+   * recovers it from a 2-byte count. The multiply only happens for flows
+   * the operator asked to log. */
+  /* Deliberately NOT gated on sess->logged.
+   *
+   * logged means "a final record has been written", and it belongs on the
+   * close path so that one is written once. Reusing it here was wrong: a
+   * flow whose FIN or RST we already reported can keep carrying packets --
+   * VPP matches a reused 5-tuple to the same session -- and gating on it
+   * silenced interim reporting for exactly the flows that were still
+   * moving data. A port-cycling flood made that total: 65534 close records
+   * and not one interim, while traffic kept flowing.
+   *
+   * When an interim does fire after a close, logged is cleared so the
+   * teardown still writes a final record with the true last counters. The
+   * reader keeps the newest row per flow, so the sequence collapses to one
+   * line that is correct at every point along the way. */
+  if (PREDICT_FALSE (sess->log && am->fa_session_interim_log_interval))
+    {
+      u64 due = (u64) (sess->interim_n + 1) *
+		am->fa_session_interim_log_interval;
+      if (PREDICT_FALSE (now - sess->start_time >= due &&
+			 sess->interim_n != 0xffff))
+	{
+	  sess->interim_n++;
+	  sess->logged = 0;
+	  acl_log_session (sess, sw_if_index, DP_LOG_SESS_OPEN);
+	}
     }
   return 3;
 }
@@ -420,6 +510,16 @@ acl_fa_deactivate_session (acl_main_t * am, u32 sw_if_index,
       reverse_session_add_del_ip4 (am, &sess->info.kv_16_8, 0);
     }
 
+  /* Emit BEFORE the deleted flag is set, and only on the transition.
+     Deactivation is not quite once per session: acl_fa_try_recycle_session
+     reaches it by a second path, and a session logged twice reports the same
+     flow's bytes twice. Gating on the flag we are about to set makes this
+     exactly-once whatever the caller does. */
+  if (PREDICT_FALSE (sess->log && !sess->logged && !sess->deleted))
+    {
+      sess->logged = 1;
+      acl_log_session (sess, sw_if_index, DP_LOG_SESS_CLOSE);
+    }
   sess->deleted = 1;
   clib_atomic_fetch_add (&am->fa_session_total_deactivations, 1);
 }
@@ -515,7 +615,8 @@ acl_fa_try_recycle_session (acl_main_t *am, int is_input,
 always_inline fa_full_session_id_t
 acl_fa_add_session (acl_main_t * am, int is_input, int is_ip6,
 		    u32 sw_if_index, u64 now, fa_5tuple_t * p5tuple,
-		    u16 current_policy_epoch)
+		    u16 current_policy_epoch, u8 log, u32 acl_index,
+		    u32 rule_index)
 {
   fa_full_session_id_t f_sess_id;
   uword thread_index = os_get_thread_index ();
@@ -558,6 +659,20 @@ acl_fa_add_session (acl_main_t * am, int is_input, int is_ip6,
   sess->link_next_idx = FA_SESSION_BOGUS_INDEX;
   sess->deleted = 0;
   sess->is_ip6 = is_ip6;
+  /* The opening rule's logging decision travels with the session: it is the
+     only thing that still knows which rule let this flow through, because
+     the rule is never consulted again. Pool memory is reused, so the totals
+     must be zeroed here rather than assumed clean. */
+  sess->log = log;
+  sess->logged = 0;
+  sess->interim_n = 0;
+  sess->log_acl_index = acl_index;
+  sess->log_rule_index = rule_index;
+  sess->start_time = now;
+  sess->total_bytes[0] = 0;
+  sess->total_bytes[1] = 0;
+  sess->total_packets[0] = 0;
+  sess->total_packets[1] = 0;
 
   acl_fa_conn_list_add_session (am, f_sess_id, now);
 

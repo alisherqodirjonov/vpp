@@ -33,6 +33,10 @@ typedef struct
   u16 dst_port_or_code_last;
   u8 tcp_flags_value;
   u8 tcp_flags_mask;
+  /* Emit a dp_log record for every packet matching this rule. Not a match
+     field -- never read by single_rule_match_5tuple () and never part of a
+     hash mask, so adding it cannot change which packets a rule matches. */
+  u8 log;
 } acl_rule_t;
 
 

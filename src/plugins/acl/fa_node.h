@@ -117,8 +117,40 @@ typedef struct {
   u8 link_list_id;        /* +1 bytes = 17 */
   u8 deleted;             /* +1 bytes = 18 */
   u8 is_ip6;              /* +1 bytes = 19 */
-  u8 reserved1[5];        /* +5 bytes = 24 */
-  u64 reserved2[5];       /* +5*8 bytes = 64 */
+  /*
+   * Traffic accounting for the session, carved out of the space this struct
+   * already reserved. Nothing here grows it: the CT_ASSERT below still pins
+   * it at 128 bytes, and prefetch_session_entry () already prefetches
+   * sizeof (*sess), so both cache lines are on their way in before the
+   * counters are touched. The cost of keeping them is two adds per packet
+   * on data that is already in L1.
+   *
+   * Why keep them at all: a stateful rule is evaluated once, on the first
+   * packet of a flow, so neither the ACL log nor the per-rule counters can
+   * see the traffic that follows. The session is the only place in the
+   * plugin that every packet of a flow passes through.
+   *
+   * log carries the log flag of the rule that opened the session, so that
+   * "which rules do I want logged" stays one decision made in one place
+   * rather than a second, separate switch for volume.
+   */
+  /* Field order here is load-bearing: interim_n is a u16 and must land on
+     an even offset, so it follows the single u8 after is_ip6 rather than
+     two. Getting it wrong pads the struct past 128 bytes, which the
+     assertion below catches at compile time. */
+  u8 log;                 /* +1 bytes = 20 */
+  /* How many interim records this session has produced. A count, not a
+     deadline: a deadline needs 8 bytes and there is no room, while the
+     count recovers it as (interim_n + 1) * interval. Saturates at 65535,
+     which at the default interval is a week of unbroken traffic. */
+  u16 interim_n;          /* +2 bytes = 22 */
+  u8 logged;              /* +1 bytes = 23, final record already emitted */
+  u8 reserved1[1];        /* +1 bytes = 24 */
+  u64 total_bytes[2];     /* +16 bytes = 40, indexed by is_input */
+  u32 total_packets[2];   /* +8 bytes = 48, indexed by is_input */
+  u64 start_time;         /* +8 bytes = 56, for the duration in the log */
+  u32 log_acl_index;      /* +4 bytes = 60, the rule that opened it */
+  u32 log_rule_index;     /* +4 bytes = 64 */
 } fa_session_t;
 
 #define FA_POLICY_EPOCH_MASK 0x7fff
