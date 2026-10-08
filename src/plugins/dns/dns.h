@@ -162,6 +162,12 @@ typedef struct
   u32 max_ttl_in_seconds;
   u32 random_seed;
 
+  /* Stats-segment gauges under /dns/cache/. Node errors are not this:
+     REQUEST PROCESSED is never incremented, RESOLUTION_REQUIRED counts
+     parked retransmits, and neither covers API lookups. */
+  u32 cache_entries_idx, cache_limit_idx, cache_hits_idx, cache_misses_idx;
+  u64 cache_hits, cache_misses;
+
   /** message-ID base */
   u16 msg_id_base;
 

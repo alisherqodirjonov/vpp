@@ -3,10 +3,7 @@
 
 #include "dp_log.h"
 
-/* dp_log_main is in dp_log.c (static there), so CLI reads only exported pieces.
- * If you want richer stats (drops per thread), export accessors or make dp_log_main non-static.
- * Here we keep it minimal: enabled flag only.
- */
+void dp_log_refresh_stats (vlib_main_t *vm);
 
 static const char *
 dp_log_dns_mode_name (int mode)
@@ -113,6 +110,7 @@ dp_log_cli_show (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *c
 								    : "off",
 		   dp_log_acl_flags_get () & DP_LOG_ACL_F_ALL_DENY ? "on"
 								  : "off");
+  dp_log_refresh_stats (vm);
   return 0;
 }
 

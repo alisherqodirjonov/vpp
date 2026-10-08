@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <vlib/vlib.h>
+#include <vlib/stats/stats.h>
 #include <vppinfra/clib.h>
 #include <vppinfra/format.h>
 
@@ -160,6 +161,11 @@ typedef struct
   u32 sess_ring_size;
   dp_log_sess_ring_t *sess_rings;
 
+  /* Stats-segment gauges. Published from dp-log-stats-process (main
+     thread, 1 Hz), never from the writer pthread. */
+  u32 acl_drops_idx, dns_drops_idx, acl_depth_idx, dns_depth_idx;
+  u32 sess_drops_idx, sess_depth_idx;
+
   pthread_t writer_thread;
   volatile int stop;
 } dp_log_main_t;
@@ -290,6 +296,77 @@ dp_log_sess_ring_try_deq (dp_log_sess_ring_t *r, dp_log_sess_event_t *out)
   __atomic_store_n (&r->tail, (tail + 1) & r->mask, __ATOMIC_RELEASE);
   return 1;
 }
+
+/* Snapshot ring drops/depth into the stats segment; with vm, also print.
+   Must not run on the writer pthread: that thread is created with
+   pthread_create, so __os_thread_index stays 0. vlib_stats_set_gauge is an
+   unlocked store into directory_vector, which the main thread reallocates
+   when an ACL or interface is created. The worker barrier does not stop a
+   raw pthread, and vlib_stats_segment_lock would impersonate thread 0.
+   Publish from the process node below (main thread, 1 Hz) instead. */
+void
+dp_log_refresh_stats (vlib_main_t *vm)
+{
+  dp_log_main_t *lm = &dp_log_main;
+  u64 adrops = 0, ddrops = 0, sdrops = 0, adepth = 0, ddepth = 0, sdepth = 0;
+  for (u32 i = 0; i < lm->n_threads; i++)
+    {
+      dp_log_ring_t *a = &lm->rings[i];
+      dp_log_dns_ring_t *d = &lm->dns_rings[i];
+      /* Session records: the ring a port-cycling flood fills, since every
+	 tuple is a session reporting every interim interval. */
+      dp_log_sess_ring_t *s = &lm->sess_rings[i];
+      u32 ad = (__atomic_load_n (&a->head, __ATOMIC_RELAXED) -
+		__atomic_load_n (&a->tail, __ATOMIC_RELAXED)) & a->mask;
+      u32 dd = (__atomic_load_n (&d->head, __ATOMIC_RELAXED) -
+		__atomic_load_n (&d->tail, __ATOMIC_RELAXED)) & d->mask;
+      u32 sd = (__atomic_load_n (&s->head, __ATOMIC_RELAXED) -
+		__atomic_load_n (&s->tail, __ATOMIC_RELAXED)) & s->mask;
+      u64 ax = __atomic_load_n (&a->drops, __ATOMIC_RELAXED);
+      u64 dx = __atomic_load_n (&d->drops, __ATOMIC_RELAXED);
+      u64 sx = __atomic_load_n (&s->drops, __ATOMIC_RELAXED);
+      adrops += ax;
+      ddrops += dx;
+      sdrops += sx;
+      adepth += ad;
+      ddepth += dd;
+      sdepth += sd;
+      if (vm)
+	vlib_cli_output (vm,
+			 "  ring %u  acl drops %llu depth %u  session drops "
+			 "%llu depth %u  dns drops %llu depth %u",
+			 i, (unsigned long long) ax, ad,
+			 (unsigned long long) sx, sd, (unsigned long long) dx,
+			 dd);
+    }
+  vlib_stats_set_gauge (lm->acl_drops_idx, adrops);
+  vlib_stats_set_gauge (lm->dns_drops_idx, ddrops);
+  vlib_stats_set_gauge (lm->sess_drops_idx, sdrops);
+  vlib_stats_set_gauge (lm->acl_depth_idx, adepth);
+  vlib_stats_set_gauge (lm->dns_depth_idx, ddepth);
+  vlib_stats_set_gauge (lm->sess_depth_idx, sdepth);
+}
+
+static uword
+dp_log_stats_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *f)
+{
+  uword *event_data = 0;
+
+  while (1)
+    {
+      vlib_process_wait_for_event_or_clock (vm, 1.0);
+      vlib_process_get_events (vm, &event_data);
+      vec_reset_length (event_data);
+      dp_log_refresh_stats (0);
+    }
+  return 0;
+}
+
+VLIB_REGISTER_NODE (dp_log_stats_process_node, static) = {
+  .function = dp_log_stats_process,
+  .type = VLIB_NODE_TYPE_PROCESS,
+  .name = "dp-log-stats-process",
+};
 
 /* ----------------------- Worker API ----------------------- */
 
@@ -1389,6 +1466,13 @@ dp_log_init (vlib_main_t *vm)
       __atomic_store_n (&r->tail, 0, __ATOMIC_RELAXED);
       __atomic_store_n (&r->drops, 0, __ATOMIC_RELAXED);
     }
+
+  lm->acl_drops_idx = vlib_stats_add_gauge ("/dp-log/acl/drops");
+  lm->dns_drops_idx = vlib_stats_add_gauge ("/dp-log/dns/drops");
+  lm->acl_depth_idx = vlib_stats_add_gauge ("/dp-log/acl/ring-depth");
+  lm->dns_depth_idx = vlib_stats_add_gauge ("/dp-log/dns/ring-depth");
+  lm->sess_drops_idx = vlib_stats_add_gauge ("/dp-log/session/drops");
+  lm->sess_depth_idx = vlib_stats_add_gauge ("/dp-log/session/ring-depth");
 
   lm->stop = 0;
   if (pthread_create (&lm->writer_thread, 0, dp_log_writer_thread_fn, lm) != 0)
