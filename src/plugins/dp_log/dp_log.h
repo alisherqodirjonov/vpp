@@ -30,7 +30,11 @@ typedef struct
      back into a decision. Fits in the existing padding, so the event stays
      the same size and the ring geometry is untouched. */
   u8 is_input;
-  u8 _pad[2];
+  /* Bytes in this packet, clamped to 65535. The writer folds a flow's
+     packets into one row, and this is what lets that row carry a volume the
+     way a session row does. Takes the old padding, so the event stays the
+     same size and the ring geometry is untouched. */
+  u16 len;
 
   union {
     struct { ip4_address_t src, dst; } v4;

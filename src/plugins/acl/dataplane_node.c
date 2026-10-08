@@ -657,6 +657,17 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 			 * rule, so the two agree. */
 		      if (!is_input && action != 0)
 			want_log = 0;
+
+		      /* A permit+reflect that got this far opened a session
+			 (one that could not was rewritten to deny above), and
+			 that session carries the same log flag. It reports
+			 the connection once, with its volume -- every 10 s
+			 while it runs, then when it ends -- so a match row
+			 here would only say the same thing twice, without
+			 the numbers. One row per connection, like the NAT
+			 session log. */
+		      if (2 == action)
+			want_log = 0;
 		    }
 		  else
 		    /* The implicit deny at the end of the list. No rule
@@ -689,6 +700,10 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 			  /* Input and output ACLs are different policies and
 			     a log that conflates them cannot be read. */
 			  ev.is_input = (u8) is_input;
+			  {
+			    u32 len = vlib_buffer_length_in_chain (vm, b[0]);
+			    ev.len = (u16) clib_min (len, 0xffff);
+			  }
 
 			  if (!is_ip6)
 			    {

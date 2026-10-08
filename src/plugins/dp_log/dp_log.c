@@ -132,6 +132,13 @@ typedef struct
   int writer_core; /* linux cpu id, -1 means no pin */
   u8 *path;	   /* null-terminated C string (vec) */
 
+  /* Match rows are folded into one row per flow, the way a session row
+     describes one connection. A flow's row is written once it has been
+     quiet for flow_idle_s, or -- so a flow that never stops still shows
+     up -- once it has been open for flow_active_s. Seconds; config only. */
+  u32 flow_idle_s;
+  u32 flow_active_s;
+
   /* runtime */
   int fd;
   u32 n_threads;
@@ -590,15 +597,23 @@ dp_log_format_ip (char *dst, size_t dst_sz, const dp_log_acl_event_t *ev,
     }
 }
 
-/* Event aggregation key - for counting same 5-tuple + ACL rule hits */
+/* Flow key for folding match events into one row per flow.
+ *
+ * Full addresses, not a digest of them: a flow now lives in the table for
+ * up to flow_active_s rather than one second, so two IPv6 flows that shared
+ * a 64-bit prefix would be reported as one for minutes at a time. */
 typedef struct
 {
-  u64 src_dst_tuple; /* Combined source/dest for quick comparison */
-  u32 sport_dport;   /* Combined ports */
+  u8 src[16];
+  u8 dst[16];
+  u16 sport;
+  u16 dport;
   u8 proto;
   u8 is_ip6;
   u8 is_input;
-  u8 _pad;
+  /* Same rule, two verdicts: a permit+reflect that found the session table
+     full is rewritten to deny. Those are different events. */
+  u8 action;
 
   u32 acl_index;
   u32 rule_index;
@@ -608,24 +623,104 @@ typedef struct
   u32 sw_if_index;
 } dp_log_agg_key_t;
 
-/* Aggregated event with count */
+/* One flow being folded. */
 typedef struct
 {
   dp_log_agg_key_t key;
-  u64 count; /* 0 means the slot is free */
-  dp_log_acl_event_t last_event; /* Keep last event for full logging */
+  u64 count; /* packets; 0 means the slot is free */
+  u64 bytes;
+  u64 first_ts_ns; /* first packet, dataplane clock */
+  /* Writer's monotonic clock, for expiry. The dataplane timestamps say when
+     the packets happened; these say how long the writer has been holding
+     the flow, which is what the timeouts are about. */
+  u64 first_ms;
+  u64 last_ms;
+  dp_log_acl_event_t last_event; /* the tuple and the last packet's time */
 } dp_log_agg_event_t;
 
-/* Append one ACL match row to the batching buffer, flushing it to disk if
- * the row would not fit. Shared by the per-second aggregate flush and the
- * overflow path, so a row written while the table is full looks identical
- * to one that went through aggregation -- it simply carries count=1. */
+static void
+dp_log_agg_key_from_event (dp_log_agg_key_t *key,
+			   const dp_log_acl_event_t *ev)
+{
+  clib_memset (key, 0, sizeof (*key));
+  if (!ev->is_ip6)
+    {
+      clib_memcpy_fast (key->src, &ev->ip.v4.src, 4);
+      clib_memcpy_fast (key->dst, &ev->ip.v4.dst, 4);
+    }
+  else
+    {
+      clib_memcpy_fast (key->src, &ev->ip.v6.src, 16);
+      clib_memcpy_fast (key->dst, &ev->ip.v6.dst, 16);
+    }
+  key->sport = ev->sport;
+  key->dport = ev->dport;
+  key->proto = ev->proto;
+  key->is_ip6 = ev->is_ip6;
+  key->is_input = ev->is_input;
+  key->action = ev->action;
+  key->acl_index = ev->acl_index;
+  key->rule_index = ev->rule_index;
+  key->sw_if_index = ev->sw_if_index;
+}
+
+static u32
+dp_log_agg_hash (const dp_log_agg_key_t *key)
+{
+  /* djb2: the writer thread is not a VPP thread and must not pull in
+     anything that might touch the VPP heap. */
+  u64 h = 5381;
+  const u8 *p = (const u8 *) key;
+  for (u32 j = 0; j < sizeof (*key); j++)
+    h = ((h << 5) + h) + p[j];
+  return (u32) (h ^ (h >> 32));
+}
+
+/* Find the flow's slot, claiming a free one if it is new. Returns 0 when the
+ * flow is new and the table is already carrying as much as it should: the
+ * caller writes that packet through on its own. Linear probe; the table is
+ * never more than half full, so probes stay short. */
+static dp_log_agg_event_t *
+dp_log_agg_lookup (dp_log_agg_event_t *slots, u32 cap, u32 *n,
+		   const dp_log_agg_key_t *key)
+{
+  u32 slot = dp_log_agg_hash (key) & (cap - 1);
+  for (u32 probe = 0; probe < cap; probe++)
+    {
+      dp_log_agg_event_t *cand = &slots[(slot + probe) & (cap - 1)];
+      if (cand->count == 0)
+	{
+	  if (*n >= cap / 2)
+	    return 0;
+	  clib_memset (cand, 0, sizeof (*cand));
+	  cand->key = *key;
+	  (*n)++;
+	  return cand;
+	}
+      if (0 == memcmp (&cand->key, key, sizeof (*key)))
+	return cand;
+    }
+  return 0;
+}
+
+/* Append one ACL row to the batching buffer, flushing it to disk if the row
+ * would not fit.
+ *
+ * A row describes a flow the way a session row does: ts is its LAST packet,
+ * duration_ms reaches back to its first, and the volume sits in the column
+ * for the arc it was seen on. A packet written through on overflow is just
+ * a flow of one -- same columns, count=1, duration 0. */
 static void
 dp_log_write_acl_row (dp_log_main_t *lm, char *out, int *out_len, int cap,
-		      const dp_log_acl_event_t *ev, u64 count)
+		      const dp_log_acl_event_t *ev, u64 count, u64 bytes,
+		      u64 first_ts_ns)
 {
   char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN], ts[32], line[512];
+  char vol[96];
   int len;
+  f64 dur_ms = first_ts_ns && ev->ts_ns > first_ts_ns ?
+		 (f64) (ev->ts_ns - first_ts_ns) / 1e6 :
+		 0;
 
   if (!dp_log_format_ip (src, sizeof (src), ev, 1))
     clib_strncpy (src, "?", sizeof (src));
@@ -633,14 +728,23 @@ dp_log_write_acl_row (dp_log_main_t *lm, char *out, int *out_len, int cap,
     clib_strncpy (dst, "?", sizeof (dst));
   dp_log_format_wall_time_ms (ts, sizeof (ts), lm, ev->ts_ns);
 
+  /* bytes_in,bytes_out,pkts_in,pkts_out -- one side only: a denied or
+     stateless flow is seen in the one direction it was evaluated in. */
+  if (ev->is_input)
+    snprintf (vol, sizeof (vol), "%llu,0,%llu,0", (unsigned long long) bytes,
+	      (unsigned long long) count);
+  else
+    snprintf (vol, sizeof (vol), "0,%llu,0,%llu", (unsigned long long) bytes,
+	      (unsigned long long) count);
+
   len = snprintf (line, sizeof (line),
-		  "%s,match,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s,%llu,,,,,\n",
+		  "%s,match,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s,%llu,%.3f,%s\n",
 		  ts, (unsigned) ev->is_ip6, (unsigned) ev->proto,
 		  (unsigned) ev->sport, (unsigned) ev->dport,
 		  (unsigned) ev->sw_if_index, (unsigned) ev->fib_index,
 		  (unsigned) ev->acl_index, (unsigned) ev->rule_index,
 		  (unsigned) ev->action, ev->is_input ? "in" : "out", src, dst,
-		  (unsigned long long) count);
+		  (unsigned long long) count, dur_ms, vol);
   if (len <= 0)
     return;
 
@@ -651,6 +755,54 @@ dp_log_write_acl_row (dp_log_main_t *lm, char *out, int *out_len, int cap,
     }
   clib_memcpy_fast (out + *out_len, line, len);
   *out_len += len;
+}
+
+/* Write and drop every flow that has finished (or, with all set, every
+ * flow), then rehash the survivors.
+ *
+ * Rebuilt rather than deleted in place: removing from a linear-probe table
+ * while walking it either skips entries or needs tombstones, and a rebuild
+ * once a second over a fixed-size table costs a few hundred microseconds
+ * on a thread that exists to do this. Returns the number of flows written. */
+static u32
+dp_log_agg_expire (dp_log_main_t *lm, char *out, int *out_len, int cap,
+		   dp_log_agg_event_t *slots, dp_log_agg_event_t *spare,
+		   u32 agg_cap, u32 *n, u64 now_ms, int all)
+{
+  u64 idle_ms = (u64) lm->flow_idle_s * 1000;
+  u64 active_ms = (u64) lm->flow_active_s * 1000;
+  u32 kept = 0, written = 0;
+
+  for (u32 i = 0; i < agg_cap; i++)
+    {
+      dp_log_agg_event_t *e = &slots[i];
+      if (e->count == 0)
+	continue;
+      if (all || now_ms - e->last_ms >= idle_ms ||
+	  now_ms - e->first_ms >= active_ms)
+	{
+	  dp_log_write_acl_row (lm, out, out_len, cap, &e->last_event,
+				e->count, e->bytes, e->first_ts_ns);
+	  written++;
+	}
+      else
+	spare[kept++] = *e;
+    }
+
+  if (written == 0)
+    return 0;
+
+  memset (slots, 0, agg_cap * sizeof (*slots));
+  *n = 0;
+  for (u32 i = 0; i < kept; i++)
+    {
+      dp_log_agg_event_t *e = dp_log_agg_lookup (slots, agg_cap, n,
+						 &spare[i].key);
+      /* Cannot fail: kept <= the count the table already held. */
+      if (e)
+	*e = spare[i];
+    }
+  return written;
 }
 
 static void *
@@ -683,31 +835,37 @@ dp_log_writer_thread_fn (void *arg)
    * while being flooded -- that is precisely when it must stay cheap and
    * predictable. When the table fills, events are written through
    * unaggregated rather than dropped, so a flood costs disk rather than
-   * visibility. */
+   * visibility.
+   *
+   * Sized for flows held up to flow_active_s, not for one second's worth:
+   * 8192 concurrent flows, about 2.4 MB per table. agg_spare is the
+   * rebuild target for dp_log_agg_expire. */
   enum
   {
-    AGG_CAP = 1 << 13
-  }; /* 8192 distinct flows per second before falling through */
+    AGG_CAP = 1 << 14
+  };
   dp_log_agg_event_t *agg_slots = calloc (AGG_CAP, sizeof (*agg_slots));
+  dp_log_agg_event_t *agg_spare = calloc (AGG_CAP, sizeof (*agg_spare));
   u32 agg_count = 0;
   u64 overflow_events = 0;
 
-  if (!out || !agg_slots)
+  if (!out || !agg_slots || !agg_spare)
     {
       dp_log_warn ("writer thread could not allocate; logging off");
       free (out);
       free (agg_slots);
+      free (agg_spare);
       return 0;
     }
 
-  /* Flush pacing */
+  /* Expiry pacing: finished flows are looked for once a second. */
   struct timespec last_flush;
   clock_gettime (CLOCK_MONOTONIC, &last_flush);
   struct timespec last_stat = last_flush;
   enum
   {
     FLUSH_INTERVAL_MS = 1000
-  }; /* 1 second aggregation window */
+  };
 
   int loop_count = 0;
 
@@ -930,10 +1088,24 @@ dp_log_writer_thread_fn (void *arg)
 
       if (!acl_on)
 	{
+	  /* Logging was just turned off: write the flows still held rather
+	     than sit on them until it is turned back on. */
+	  if (agg_count > 0 && lm->fd >= 0)
+	    {
+	      dp_log_agg_expire (lm, out, &out_len, OUTBUF_SZ, agg_slots,
+				 agg_spare, AGG_CAP, &agg_count, 0, 1);
+	      if (out_len > 0)
+		(void) write (lm->fd, out, out_len);
+	      out_len = 0;
+	    }
 	  if (!did_work)
 	    usleep (10 * 1000);
 	  continue;
 	}
+
+      struct timespec now;
+      clock_gettime (CLOCK_MONOTONIC, &now);
+      u64 now_ms = (u64) now.tv_sec * 1000 + (u64) now.tv_nsec / 1000000;
 
       for (u32 ti = 0; ti < lm->n_threads; ti++)
 	{
@@ -946,92 +1118,44 @@ dp_log_writer_thread_fn (void *arg)
 	      did_work = 1;
 	      n++;
 
-	      /* Create aggregation key */
 	      dp_log_agg_key_t key;
-	      clib_memset (&key, 0, sizeof (key));
-	      key.proto = ev.proto;
-	      key.is_ip6 = ev.is_ip6;
-	      key.acl_index = ev.acl_index;
-	      key.rule_index = ev.rule_index;
-	      key.sw_if_index = ev.sw_if_index;
-	      key.is_input = ev.is_input;
-
-	      if (!ev.is_ip6)
-		{
-		  clib_memcpy_fast (&key.src_dst_tuple, &ev.ip.v4.src, 8);
-		}
-	      else
-		{
-		  /* For IPv6, use first 64 bits of src + dst */
-		  key.src_dst_tuple = *(u64 *) &ev.ip.v6.src;
-		}
-	      key.sport_dport = ((u32) ev.sport << 16) | ev.dport;
-
-	      /* Calculate hash of key - simple djb2 hash */
-	      u64 hash_val = 5381;
-	      u8 *ptr = (u8 *) &key;
-	      for (u32 j = 0; j < sizeof (key); j++)
-		hash_val = ((hash_val << 5) + hash_val) + ptr[j];
-
-	      /* Linear probe. The table is never more than half full before
-		 the overflow path below takes over, so the probe is short. */
-	      dp_log_agg_event_t *agg_event = 0;
-	      u32 slot = (u32) (hash_val & (AGG_CAP - 1));
-	      for (u32 probe = 0; probe < AGG_CAP; probe++)
-		{
-		  dp_log_agg_event_t *cand =
-		    &agg_slots[(slot + probe) & (AGG_CAP - 1)];
-		  if (cand->count == 0)
-		    {
-		      /* Free slot: claim it, unless the table is already
-			 carrying as much as it should. */
-		      if (agg_count >= AGG_CAP / 2)
-			break;
-		      cand->key = key;
-		      agg_count++;
-		      agg_event = cand;
-		      break;
-		    }
-		  if (0 == memcmp (&cand->key, &key, sizeof (key)))
-		    {
-		      agg_event = cand;
-		      break;
-		    }
-		}
+	      dp_log_agg_key_from_event (&key, &ev);
+	      dp_log_agg_event_t *agg_event =
+		dp_log_agg_lookup (agg_slots, AGG_CAP, &agg_count, &key);
 
 	      if (PREDICT_FALSE (agg_event == 0))
 		{
 		  /* Overflowing: write this one through on its own rather
 		     than lose it. A flood should cost disk, not visibility. */
 		  overflow_events++;
-		  dp_log_write_acl_row (lm, out, &out_len, OUTBUF_SZ, &ev, 1);
+		  dp_log_write_acl_row (lm, out, &out_len, OUTBUF_SZ, &ev, 1,
+					ev.len, ev.ts_ns);
 		  continue;
 		}
 
+	      if (agg_event->count == 0)
+		{
+		  agg_event->first_ts_ns = ev.ts_ns;
+		  agg_event->first_ms = now_ms;
+		}
 	      agg_event->count++;
+	      agg_event->bytes += ev.len;
+	      agg_event->last_ms = now_ms;
 	      agg_event->last_event = ev;
 	    }
 	}
 
-      /* Check if we should flush aggregated results (every 1 second) */
-      struct timespec now;
-      clock_gettime (CLOCK_MONOTONIC, &now);
-
+      /* Once a second, write out the flows that have finished. */
       long dt_ms = (now.tv_sec - last_flush.tv_sec) * 1000L +
 		   (now.tv_nsec - last_flush.tv_nsec) / 1000000L;
 
-      if (dt_ms >= FLUSH_INTERVAL_MS && agg_count > 0)
+      if (dt_ms >= FLUSH_INTERVAL_MS)
 	{
-	  for (u32 i = 0; i < AGG_CAP; i++)
-	    {
-	      if (agg_slots[i].count == 0)
-		continue;
-	      dp_log_write_acl_row (lm, out, &out_len, OUTBUF_SZ,
-				    &agg_slots[i].last_event,
-				    agg_slots[i].count);
-	    }
+	  if (agg_count > 0)
+	    dp_log_agg_expire (lm, out, &out_len, OUTBUF_SZ, agg_slots,
+			       agg_spare, AGG_CAP, &agg_count, now_ms, 0);
 
-	  /* Flush buffer */
+	  /* Flush buffer: overflow rows and expired flows alike. */
 	  if (out_len > 0)
 	    {
 	      (void) write (lm->fd, out, out_len);
@@ -1040,18 +1164,12 @@ dp_log_writer_thread_fn (void *arg)
 
 	  if (overflow_events)
 	    {
-	      dp_log_warn ("%llu ACL events in the last window exceeded the "
-			   "%u-flow aggregation table and were written "
-			   "individually",
+	      dp_log_warn ("%llu ACL events in the last second found the "
+			   "%u-flow table full and were written individually",
 			   (unsigned long long) overflow_events,
 			   (unsigned) (AGG_CAP / 2));
 	      overflow_events = 0;
 	    }
-
-	  /* Clear the window. memset, not free: the table is allocated once
-	     for the life of the thread. */
-	  memset (agg_slots, 0, AGG_CAP * sizeof (*agg_slots));
-	  agg_count = 0;
 
 	  last_flush = now;
 	}
@@ -1060,11 +1178,20 @@ dp_log_writer_thread_fn (void *arg)
 	usleep (10 * 1000); // sleep 10ms if no work done
     }
 
-  /* Final flush */
-  if (lm->fd >= 0 && out_len > 0)
-    (void) write (lm->fd, out, out_len);
+  /* Final flush. Flows still open are written as they stand, so a stop
+     keeps their counts instead of discarding them -- the same thing the
+     NAT session log does on shutdown. */
+  if (lm->fd >= 0)
+    {
+      if (agg_count > 0)
+	dp_log_agg_expire (lm, out, &out_len, OUTBUF_SZ, agg_slots, agg_spare,
+			   AGG_CAP, &agg_count, 0, 1);
+      if (out_len > 0)
+	(void) write (lm->fd, out, out_len);
+    }
 
   /* Clean up */
+  free (agg_spare);
   free (agg_slots);
   free (out);
   return 0;
@@ -1117,6 +1244,10 @@ dp_log_config (vlib_main_t *vm, unformat_input_t *input)
 	}
       else if (unformat (input, "session-ring-size %u", &lm->sess_ring_size))
 	;
+      else if (unformat (input, "flow-idle-timeout %u", &lm->flow_idle_s))
+	;
+      else if (unformat (input, "flow-active-timeout %u", &lm->flow_active_s))
+	;
       else if (unformat (input, "dns-path %s", &lm->dns_path))
 	;
       else if (unformat (input, "dns-ring-size %u", &lm->dns_ring_size))
@@ -1166,6 +1297,16 @@ dp_log_init (vlib_main_t *vm)
      connections per second. 4096 absorbs a burst of short-lived connections
      without reserving the ACL ring's footprint. */
   lm->sess_ring_size = dp_log_pow2_or_default (lm->sess_ring_size, 1 << 12);
+  /* 15 s idle outlasts the gap between pings and between retries of a
+     blocked connection attempt, so each is one row rather than many. 300 s
+     active keeps a flow that never stops -- a scan, a flood -- from staying
+     invisible until it does. */
+  if (lm->flow_idle_s == 0)
+    lm->flow_idle_s = 15;
+  if (lm->flow_active_s == 0)
+    lm->flow_active_s = 300;
+  if (lm->flow_active_s < lm->flow_idle_s)
+    lm->flow_active_s = lm->flow_idle_s;
   lm->writer_core =
     (lm->writer_core == 0 && lm->writer_core == 0) ? -1 : lm->writer_core;
   /* (above line effectively keeps default -1 if not set; harmless) */
