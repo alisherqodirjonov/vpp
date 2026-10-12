@@ -18,6 +18,7 @@
 #include <vnet/vnet.h>
 #include <vnet/plugin/plugin.h>
 #include <acl/acl.h>
+#include <dp_log/dp_log.h>
 
 #include <vnet/l2/l2_classify.h>
 #include <vnet/l2/l2_in_out_feat_arc.h>
@@ -187,6 +188,10 @@ acl_print_acl_x (acl_vector_print_func_t vpr, vlib_main_t * vm,
 	    format (out0, " tcpflags %d mask %d", r->tcp_flags_value,
 		    r->tcp_flags_mask);
 	}
+      if (r->log)
+	{
+	  out0 = format (out0, " log");
+	}
       out0 = format (out0, "\n");
       vpr (vm, out0);
     }
@@ -310,6 +315,127 @@ acl_api_invalid_prefix (const vl_api_prefix_t * prefix)
   return (!valid_af) || ip_prefix_decode2 (prefix, &ip_prefix);
 }
 
+/* dp_log state shared by the dataplane node.
+ *
+ * It lives HERE, in a file compiled once, and not in dataplane_node.c, which
+ * is a MULTIARCH source: that file is compiled separately for generic, hsw,
+ * skx and icl, and each copy gets its own file-statics. Packets run through
+ * whichever variant the CPU selected while "show acl dp-log stats" reads the
+ * variant VPP happened to register the CLI from -- so the handle looked
+ * unresolved and the counters read zero on a box that was logging correctly.
+ * A debug view that says the feature is unavailable while it works is worse
+ * than no debug view.
+ *
+ * Not static: dataplane_node.c reaches these by extern. They stay inside
+ * this plugin (-fvisibility=hidden), so nothing crosses a plugin boundary.
+ */
+dp_log_client_t acl_dp_log;
+u64 acl_dp_log_calls;
+u64 acl_dp_log_events;
+
+/* Emit a session record, interim or final.
+ *
+ * Runs on session teardown, which is orders of magnitude rarer than the
+ * packet path, so a real call is fine and the dp_log handle stays a single
+ * instance rather than one per march variant.
+ *
+ * The session clock counts raw TSC cycles; converting here keeps the wire
+ * format in plain nanoseconds.
+ */
+void
+acl_log_session (fa_session_t *sess, u32 sw_if_index, u8 kind)
+{
+  dp_log_sess_event_t ev;
+  fa_session_l4_key_t l4;
+  u64 now;
+
+  dp_log_client_resolve (&acl_dp_log);
+  if (!dp_log_client_acl_on (&acl_dp_log))
+    return;
+
+  clib_memset (&ev, 0, sizeof (ev));
+
+  /* Both figures describe the TRAFFIC, not the bookkeeping.
+   *
+   * A session is not reaped when it stops carrying packets; it is reaped
+   * when it has been silent for its idle timeout. Measuring to that moment
+   * made a ping that ran for fifteen minutes report twenty-five, and stamped
+   * the row ten minutes after the last packet -- so the log disagreed with
+   * every other log about when the traffic happened. last_active_time is
+   * the last packet, and that is what both fields are built from.
+   *
+   * ts_ns must be nanoseconds since VPP started, because that is the base
+   * the writer converts against. It is derived by stepping back from the
+   * current relative time by the TSC gap, rather than by feeding an old TSC
+   * value to clib_time_now (), which advances the clock's own state.
+   *
+   * vlib_get_main () and not am->vlib_main: this runs on a worker thread
+   * when a TCP close triggers the early write, and each worker has its own
+   * clock. Reading the main thread's from here would be a data race. */
+  vlib_main_t *vm = vlib_get_main ();
+  f64 spc = vm->clib_time.seconds_per_clock;
+  f64 rel = clib_time_now (&vm->clib_time);
+
+  now = clib_cpu_time_now ();
+  if (sess->last_active_time <= now)
+    rel -= (f64) (now - sess->last_active_time) * spc;
+  if (rel < 0)
+    rel = 0;
+  ev.ts_ns = (u64) (rel * 1e9);
+
+  ev.duration_ns =
+    sess->start_time < sess->last_active_time
+      ? (u64) ((f64) (sess->last_active_time - sess->start_time) * spc * 1e9)
+      : 0;
+
+  l4.as_u64 = sess->info.l4.as_u64;
+  ev.is_ip6 = sess->is_ip6;
+  ev.proto = l4.proto;
+  ev.sport = l4.port[0];
+  ev.dport = l4.port[1];
+  ev.is_input = (l4.l4_flags & FA_SK_L4_FLAG_IS_INPUT) ? 1 : 0;
+  ev.kind = kind;
+  ev.sw_if_index = sw_if_index;
+  ev.acl_index = sess->log_acl_index;
+  ev.rule_index = sess->log_rule_index;
+  ev.bytes[0] = sess->total_bytes[0];
+  ev.bytes[1] = sess->total_bytes[1];
+  ev.packets[0] = sess->total_packets[0];
+  ev.packets[1] = sess->total_packets[1];
+
+  if (sess->is_ip6)
+    {
+      clib_memcpy_fast (&ev.ip.v6.src, &sess->info.ip6_addr[0],
+			sizeof (ev.ip.v6.src));
+      clib_memcpy_fast (&ev.ip.v6.dst, &sess->info.ip6_addr[1],
+			sizeof (ev.ip.v6.dst));
+    }
+  else
+    {
+      clib_memcpy_fast (&ev.ip.v4.src, &sess->info.ip4_addr[0],
+			sizeof (ev.ip.v4.src));
+      clib_memcpy_fast (&ev.ip.v4.dst, &sess->info.ip4_addr[1],
+			sizeof (ev.ip.v4.dst));
+    }
+
+  (void) dp_log_client_sess_enq (&acl_dp_log, os_get_thread_index (), &ev);
+}
+
+/* Recompute am->n_logging_rules from scratch. Cheap (config-time only) and
+   cannot drift, which incremental accounting across replace/delete would. */
+static void
+acl_recount_logging_rules (acl_main_t * am)
+{
+  u32 n = 0;
+  acl_list_t *a;
+  pool_foreach (a, am->acls)
+    {
+      acl_rule_t *r;
+      vec_foreach (r, a->rules) if (r->log) n++;
+    }
+  am->n_logging_rules = n;
+}
+
 static int
 acl_add_list (u32 count, vl_api_acl_rule_t rules[],
 	      u32 * acl_list_index, u8 * tag)
@@ -386,6 +512,7 @@ acl_add_list (u32 count, vl_api_acl_rule_t rules[],
       r->dst_port_or_code_last = ntohs (rules[i].dstport_or_icmpcode_last);
       r->tcp_flags_value = rules[i].tcp_flags_value;
       r->tcp_flags_mask = rules[i].tcp_flags_mask;
+      r->log = rules[i].log;
     }
 
   if (~0 == *acl_list_index)
@@ -413,6 +540,7 @@ acl_add_list (u32 count, vl_api_acl_rule_t rules[],
       policy_notify_acl_change (am, *acl_list_index);
     }
   validate_and_reset_acl_counters (am, *acl_list_index);
+  acl_recount_logging_rules (am);
   acl_plugin_lookup_context_notify_acl_change (*acl_list_index);
   return 0;
 }
@@ -453,6 +581,7 @@ acl_del_list (u32 acl_list_index)
   if (a->rules)
     vec_free (a->rules);
   pool_put (am->acls, a);
+  acl_recount_logging_rules (am);
   /* acl_list_index is now free, notify the lookup contexts */
   acl_plugin_lookup_context_notify_acl_change (acl_list_index);
   return 0;
@@ -1922,6 +2051,7 @@ copy_acl_rule_to_api_rule (vl_api_acl_rule_t * api_rule, acl_rule_t * r)
   api_rule->dstport_or_icmpcode_last = htons (r->dst_port_or_code_last);
   api_rule->tcp_flags_mask = r->tcp_flags_mask;
   api_rule->tcp_flags_value = r->tcp_flags_value;
+  api_rule->log = r->log;
 }
 
 static void
@@ -2900,6 +3030,11 @@ acl_set_aclplugin_acl_fn (vlib_main_t * vm,
 	  vec_validate_acl_rules (rules, rule_idx);
 	  rules[rule_idx].is_permit = 0;
 	}
+      else if (unformat (line_input, "log"))
+	{
+	  vec_validate_acl_rules (rules, rule_idx);
+	  rules[rule_idx].log = 1;
+	}
       else if (unformat (line_input, "count %d", &n_rules_override))
 	{
 	  /* we will use this later */
@@ -3680,6 +3815,30 @@ acl_clear_aclplugin_fn (vlib_main_t * vm,
   return error;
 }
 
+static clib_error_t *
+acl_set_session_interim_log_fn (vlib_main_t *vm, unformat_input_t *input,
+				vlib_cli_command_t *cmd)
+{
+  acl_main_t *am = &acl_main;
+  u32 secs;
+
+  if (!unformat (input, "%u", &secs))
+    return clib_error_return (
+      0, "usage: set acl-plugin session interim-log <seconds> (0 = off)");
+
+  am->fa_session_interim_log_interval =
+    (u64) ((f64) secs * vm->clib_time.clocks_per_second);
+  vlib_cli_output (vm, "acl-plugin session interim-log %u s%s", secs,
+		   secs ? "" : " (off)");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (aclplugin_set_session_interim_log_command, static) = {
+  .path = "set acl-plugin session interim-log",
+  .short_help = "set acl-plugin session interim-log <seconds> (0 = off)",
+  .function = acl_set_session_interim_log_fn,
+};
+
 VLIB_CLI_COMMAND (aclplugin_set_command, static) = {
     .path = "set acl-plugin",
     .short_help = "set acl-plugin session timeout {{udp idle}|tcp {idle|transient}} <seconds>",
@@ -3782,14 +3941,14 @@ VLIB_CLI_COMMAND (aclplugin_set_interface_command, static) = {
  * An ACL can optionally be assigned a 'tag' - which is an identifier
  * understood by the client. VPP does not examine it in any way.
  *
- * @cliexcmd{set acl-plugin acl <permit|deny|permit+reflect> src <PREFIX> dst
+ * @cliexcmd{set acl-plugin acl <permit|deny|permit+reflect> [log] src <PREFIX> dst
  * <PREFIX> proto <TCP|UDP> sport <X-Y> dport <X-Y> tcpflags <X> mask <X>
  * [tag FOO]}
  ?*/
 VLIB_CLI_COMMAND (aclplugin_set_acl_command, static) = {
   .path = "set acl-plugin acl",
   .short_help =
-    "set acl-plugin acl [index <idx>] <permit|deny|permit+reflect> src "
+    "set acl-plugin acl [index <idx>] <permit|deny|permit+reflect> [log] src "
     "<PREFIX> dst <PREFIX> [proto X] [sport X[-Y]] [dport X[-Y]] [tcpflags "
     "<int> mask <int>] [tag FOO] {use comma separated list for multiple "
     "rules}",
@@ -3962,6 +4121,11 @@ acl_init (vlib_main_t * vm)
   am->fa_conn_table_hash_memory_size =
     ACL_FA_CONN_TABLE_DEFAULT_HASH_MEMORY_SIZE;
   am->fa_conn_table_max_entries = ACL_FA_CONN_TABLE_DEFAULT_MAX_ENTRIES;
+  /* Ten seconds, matching the NAT session log's poll period so the two
+     views of the box move at the same rate. In CPU clocks because the
+     dataplane compares it against a TSC difference. */
+  am->fa_session_interim_log_interval =
+    (u64) (10.0 * vm->clib_time.clocks_per_second);
   am->reclassify_sessions = 0;
   vlib_thread_main_t *tm = vlib_get_thread_main ();
 

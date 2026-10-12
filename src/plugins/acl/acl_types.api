@@ -69,6 +69,13 @@ typedef acl_rule
  */
   u8 tcp_flags_mask;
   u8 tcp_flags_value;
+/*
+ * Log every packet that matches this rule, whatever the action is.
+ * Deny rules log the drop, permit rules log the pass. Off by default:
+ * a rule that matches at line rate must not start writing to disk
+ * because somebody enabled the feature globally.
+ */
+  bool log;
 };
 
 

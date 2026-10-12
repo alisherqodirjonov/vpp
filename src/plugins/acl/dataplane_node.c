@@ -30,28 +30,36 @@
 #include <vnet/plugin/plugin.h>
 #include <dp_log/dp_log.h>
 
-typedef int (*dp_log_enq_fn_t)(u32, const dp_log_acl_event_t *);
-static dp_log_enq_fn_t dp_log_enq_fp;
-static int dp_log_initialized = 0;
-static u64 dp_log_event_count = 0;
-static u64 dp_log_call_count = 0;
+/* dp_log lives in another plugin, so it is reached through a resolved handle
+ * rather than by naming its symbols -- see the boundary note in dp_log.h.
+ * The client half of that header is the only thing visible from here; the
+ * owner-side externs do not compile outside dp_log_plugin, which is what
+ * stops this from being got wrong again. */
+/* Defined once in acl.c -- see the note there. Putting them here would give
+ * each march variant its own copy, and the stats CLI would report a variant
+ * no packet ever ran through. */
+extern dp_log_client_t acl_dp_log;
+extern u64 acl_dp_log_calls;
+extern u64 acl_dp_log_events;
 
-static void
-acl_dp_log_resolve_once (void)
+/* Does the rule that matched ask to be logged?
+ *
+ * Called once per matched packet while logging is enabled, so it stays a
+ * bounds check and two dereferences. The indices come straight out of a
+ * successful lookup and are valid by construction; the bounds check is there
+ * because a lookup context can be torn down while a packet is in flight, and
+ * reading a freed rule vector is a poor price for a log line. */
+always_inline int
+acl_rule_wants_log (acl_main_t * am, u32 acl_index, u32 rule_index)
 {
-  if (PREDICT_TRUE (dp_log_initialized))
-    return;
-    
-  dp_log_initialized = 1;
-  
-  /* Use the exact plugin filename as seen in 'show plugins' */
-  dp_log_enq_fp = (dp_log_enq_fn_t)
-    vlib_get_plugin_symbol ("dp_log_plugin.so", "dp_log_acl_enq_export");
+  acl_rule_t *rules;
 
-  if (dp_log_enq_fp == 0)
-    clib_warning ("ACL: dp_log not available (dp_log_plugin.so not loaded or symbol missing)");
-  else
-    clib_warning ("ACL: dp_log hook active, function pointer = %p", dp_log_enq_fp);
+  if (PREDICT_FALSE (acl_index >= vec_len (am->acls)))
+    return 0;
+  rules = am->acls[acl_index].rules;
+  if (PREDICT_FALSE (rule_index >= vec_len (rules)))
+    return 0;
+  return rules[rule_index].log;
 }
 
 
@@ -499,77 +507,8 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 							     &match_acl_pos,
 							     &match_acl_in_index,
 							     &match_rule_index,
-							     &trace_bitmap);   /// this is what i need to log after this
+							     &trace_bitmap);
 
-
-		/* Log ONLY deny decisions that matched an ACL rule (recommended).
-		* If you also want "default deny/no match", remove the `is_match` condition.
-		*/
-
-		/*If you want to log all denies (including “no ACL matched”)
-		Change the if to:
-
-		if (PREDICT_FALSE (dp_log_is_enabled () && action == 0))
-
-		Just note: if is_match == 0, then match_acl_in_index / match_rule_index may be ~0 (you’ll see that in the file).
-		*/
-		acl_dp_log_resolve_once ();
-		if (PREDICT_FALSE (dp_log_enq_fp && is_match && action == 0)){
-		dp_log_call_count++;
-		dp_log_acl_event_t ev;
-		clib_memset (&ev, 0, sizeof (ev));
-
-		ev.ts_ns = (u64) (clib_time_now (&vm->clib_time) * 1e9);
-		ev.is_ip6      = (u8) is_ip6;
-
-		/* These field names depend on the real fa_5tuple type in your branch.
-		* Replace the 3 lines below with the correct accessors if your struct differs.
-		*/
-		ev.proto       = fa_5tuple[0].l4.proto;
-		// ev.sport       = clib_net_to_host_u16 (fa_5tuple[0].l4.port[0]);
-		// ev.dport       = clib_net_to_host_u16 (fa_5tuple[0].l4.port[1]);
-
-		ev.sport       = fa_5tuple[0].l4.port[0];
-		ev.dport       = fa_5tuple[0].l4.port[1];
-
-		ev.sw_if_index = sw_if_index[0];
-
-		/* fib_index is usually available in vnet_buffer(b0)->ip.fib_index in VPP.
-		* If your buffer doesn't have it here, set 0 or derive it elsewhere.
-		*/
-		ev.fib_index   = vnet_buffer (b[0])->ip.fib_index;
-
-		/* Matched ACL + rule */
-		ev.acl_index   = match_acl_in_index;
-		ev.rule_index  = match_rule_index;
-
-		/* IMPORTANT: in this node, deny == action 0 */
-		ev.action      = (u8) action;
-
-		if (!is_ip6)
-		{
-			/* Replace these with correct fields for your fa_5tuple if needed */
-			ev.ip.v4.src = fa_5tuple[0].ip4_addr[0];
-			ev.ip.v4.dst = fa_5tuple[0].ip4_addr[1];
-		}
-		else
-		{
-			ev.ip.v6.src = fa_5tuple[0].ip6_addr[0];
-			ev.ip.v6.dst = fa_5tuple[0].ip6_addr[1];
-		}
-
-		// dp_log_acl_enq (thread_index, &ev);
-		// dp_log_acl_enq_safe (thread_index, &ev); /* safe version that works even if dp_log plugin isn't loaded */
-		int ret = dp_log_enq_fp (thread_index, &ev);
-		if (ret)
-		  dp_log_event_count++;
-		else
-		  clib_warning ("ACL: dp_log_enq failed at call %lu (thread=%u)", dp_log_call_count, thread_index);
-
-		}
-
-
-		       
 	      if (PREDICT_FALSE
 		  (is_match && am->interface_acl_counters_enabled))
 		{
@@ -612,7 +551,31 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 			acl_fa_add_session (am, is_input, is_ip6,
 					    sw_if_index[0],
 					    now, &fa_5tuple[0],
-					    current_policy_epoch);
+					    current_policy_epoch,
+					    /* Only the ingress session logs.
+					       A flow crossing the box creates
+					       two sessions -- one on the
+					       arriving interface's input ACL,
+					       one on the departing
+					       interface's output ACL -- and
+					       each sees the whole
+					       conversation through the
+					       reverse hash key. Logging both
+					       writes the same flow twice,
+					       mirrored, doubling the file and
+					       the ring for nothing. The
+					       ingress one is the right half
+					       to keep: there "in" means from
+					       the side that opened the
+					       connection, so src and
+					       bytes_in line up with who
+					       started it. */
+					    (u8) (is_input && is_match
+						  && acl_rule_wants_log (
+						    am, match_acl_in_index,
+						    match_rule_index)),
+					    match_acl_in_index,
+					    match_rule_index);
 
 		      /* perform the accounting for the newly added session */
 		      process_established_session (vm, am,
@@ -643,6 +606,123 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 		    }
 		}
 
+	      /* ---- dp_log: per-rule logging -----------------------------
+	       *
+	       * Placed at the END of the branch on purpose. A permit+reflect
+	       * that could not get a session slot has just been rewritten to
+	       * deny above; logging any earlier would record a permit for a
+	       * packet the box actually dropped.
+	       *
+	       * Equally deliberate is that this sits INSIDE the
+	       * acl_check_needed branch. Packets riding an established
+	       * session never evaluate a rule, so there is no flag to
+	       * consult and nothing to say -- a reflexive flow is logged
+	       * once, when it is opened, which is what a firewall log is
+	       * expected to show.
+	       *
+	       * Gate order is the hot-path contract: dp_log_client_acl_on ()
+	       * is a predicted branch plus one relaxed byte load, and is
+	       * false on a box that never turned logging on. Only past it do we ask
+	       * whether ANY rule carries the flag, and only then read the
+	       * matched rule.
+	       */
+	      dp_log_client_resolve (&acl_dp_log);
+	      if (PREDICT_FALSE (dp_log_client_acl_on (&acl_dp_log)))
+		{
+		  int scope = dp_log_client_acl_scope (&acl_dp_log);
+		  int want_log;
+
+		  if (is_match)
+		    {
+		      want_log =
+			(am->n_logging_rules
+			 && acl_rule_wants_log (am, match_acl_in_index,
+						match_rule_index))
+			|| (0 == action && (scope & DP_LOG_ACL_F_ALL_DENY));
+
+		      /* A permitted packet is evaluated twice -- once by the
+			 arriving interface's input ACL, once by the departing
+			 interface's output ACL -- and both say permit. That
+			 is one event, so only the ingress side reports it,
+			 the same rule the session records already follow.
+			 Logging both doubled the file for nothing.
+			 *
+			 * Denies are exempt: a packet dropped on the output
+			 * arc was never seen on any input ACL, so suppressing
+			 * the egress side would lose the only record of it.
+			 *
+			 * The cost is that when ingress and egress are
+			 * different policies, the log names the one that let
+			 * the packet in. The session record carries the same
+			 * rule, so the two agree. */
+		      if (!is_input && action != 0)
+			want_log = 0;
+
+		      /* A permit+reflect that got this far opened a session
+			 (one that could not was rewritten to deny above), and
+			 that session carries the same log flag. It reports
+			 the connection once, with its volume -- every 10 s
+			 while it runs, then when it ends -- so a match row
+			 here would only say the same thing twice, without
+			 the numbers. One row per connection, like the NAT
+			 session log. */
+		      if (2 == action)
+			want_log = 0;
+		    }
+		  else
+		    /* The implicit deny at the end of the list. No rule
+		       matched, so no rule can carry a flag; this one is
+		       governed globally or not at all. */
+		    want_log = (scope & DP_LOG_ACL_F_UNMATCHED) != 0;
+
+		  if (PREDICT_FALSE (want_log))
+		    {
+			{
+			  dp_log_acl_event_t ev;
+
+			  __atomic_fetch_add (&acl_dp_log_calls, 1,
+					      __ATOMIC_RELAXED);
+			  clib_memset (&ev, 0, sizeof (ev));
+
+			  ev.ts_ns =
+			    (u64) (clib_time_now (&vm->clib_time) * 1e9);
+			  ev.is_ip6 = (u8) is_ip6;
+			  ev.proto = fa_5tuple[0].l4.proto;
+			  /* Already host order: acl_fill_5tuple byte-swaps
+			     on the way in. */
+			  ev.sport = fa_5tuple[0].l4.port[0];
+			  ev.dport = fa_5tuple[0].l4.port[1];
+			  ev.sw_if_index = sw_if_index[0];
+			  ev.fib_index = vnet_buffer (b[0])->ip.fib_index;
+			  ev.acl_index = is_match ? match_acl_in_index : ~0;
+			  ev.rule_index = is_match ? match_rule_index : ~0;
+			  ev.action = (u8) action;
+			  /* Input and output ACLs are different policies and
+			     a log that conflates them cannot be read. */
+			  ev.is_input = (u8) is_input;
+			  {
+			    u32 len = vlib_buffer_length_in_chain (vm, b[0]);
+			    ev.len = (u16) clib_min (len, 0xffff);
+			  }
+
+			  if (!is_ip6)
+			    {
+			      ev.ip.v4.src = fa_5tuple[0].ip4_addr[0];
+			      ev.ip.v4.dst = fa_5tuple[0].ip4_addr[1];
+			    }
+			  else
+			    {
+			      ev.ip.v6.src = fa_5tuple[0].ip6_addr[0];
+			      ev.ip.v6.dst = fa_5tuple[0].ip6_addr[1];
+			    }
+
+			  if (dp_log_client_acl_enq (&acl_dp_log, thread_index,
+						     &ev))
+			    __atomic_fetch_add (&acl_dp_log_events, 1,
+						__ATOMIC_RELAXED);
+			}
+		    }
+		}
 	    }
 
 	  {
@@ -1068,12 +1148,12 @@ acl_show_dp_log_stats (vlib_main_t * vm, unformat_input_t * input,
        vlib_cli_command_t * cmd)
 {
   vlib_cli_output (vm, "dp_log event tracking:\n");
-  vlib_cli_output (vm, "  dp_log_initialized: %d\n", dp_log_initialized);
-  vlib_cli_output (vm, "  dp_log_enq_fp: %p\n", dp_log_enq_fp);
-  vlib_cli_output (vm, "  dp_log_call_count: %lu (deny ACL matches)\n",
-   dp_log_call_count);
+  vlib_cli_output (vm, "  dp_log resolved: %d\n", acl_dp_log.resolved);
+  vlib_cli_output (vm, "  dp_log available: %d\n", acl_dp_log.ok);
+  vlib_cli_output (vm, "  dp_log_call_count: %lu (matches selected for logging)\n",
+   __atomic_load_n (&acl_dp_log_calls, __ATOMIC_RELAXED));
   vlib_cli_output (vm, "  dp_log_event_count: %lu (successfully enqueued)\n",
-   dp_log_event_count);
+   __atomic_load_n (&acl_dp_log_events, __ATOMIC_RELAXED));
   return 0;
 }
 

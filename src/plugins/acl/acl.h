@@ -301,7 +301,24 @@ typedef struct {
   vlib_combined_counter_main_t *combined_acl_counters;
   /* enable/disable ACL counters for interface processing */
   u32 interface_acl_counters_enabled;
+  /* How often a still-running logged session reports its counters, in CPU
+     clocks. Zero disables interim records, leaving only the final one. */
+  u64 fa_session_interim_log_interval;
+  /* How many rules across all ACLs carry rule->log. Read once per matched
+     packet as the outer gate of the logging branch, so that configuring the
+     feature but flagging no rule costs a single predictable compare instead
+     of a pool dereference. Recomputed on every ACL add/replace/delete by
+     acl_recount_logging_rules (); never incrementally adjusted, because a
+     replace frees a whole rule vector and an off-by-one there would silently
+     log nothing. */
+  u32 n_logging_rules;
 } acl_main_t;
+
+/* Emit a session-close record for a session whose opening rule asked to be
+   logged. Defined in acl.c (compiled once) rather than inline: it runs on
+   session teardown, not per packet, and keeping it out of the multiarch
+   translation units means one dp_log handle rather than four. */
+void acl_log_session (fa_session_t *sess, u32 sw_if_index, u8 kind);
 
 #define acl_log_err(...) \
   vlib_log(VLIB_LOG_LEVEL_ERR, acl_main.log_default, __VA_ARGS__)
