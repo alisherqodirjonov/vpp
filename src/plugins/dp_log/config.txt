@@ -77,4 +77,31 @@ The ring uses lock-free SPSC (Single Producer/Single Consumer) design with atomi
 
 
 
-==>> for writer core cpu affinity is set so it is better to isolcpus under frub setting for vpp only runs these cores (/etc/vpp/startup.conf file)
+==>> for writer core cpu affinity is set so it is better to isolcpus under frub setting for vpp only runs these cores (/etc/vpp/startup.conf file)min-free-mb - Stop writing a log when its filesystem has less than this many
+              MB free (default 1024, 0 = never stop). Skipped rows are
+              counted and reported in the log as lost_disk rows once space
+              is freed.
+
+Lost rows:
+Rows that never reach the file are reported IN the file, once a second, one
+row per cause, with the exact reason in the last column:
+  acl_logs.log: ts,lost_<cause>,,,,,,,,,,,,,<count>,<duration_ms>,,,,,,<reason>
+  dns_logs.log: ts,lost,<cause>,0,<count>,<reason>
+cause (acl file):
+  match_ring    ACL match ring full   (raise ring-size)
+  session_ring  session ring full     (raise session-ring-size)
+  write         write() failed or file not open (reason carries strerror)
+  disk          below min-free-mb     (reason carries free MB)
+The DNS file uses ring / write / disk. Ring reasons name the VPP threads whose
+ring was full. Counters: /dp-log/{acl,dns}/write-lost.
+
+Columns (acl_logs.log):
+  ts,kind,is_ip6,proto,sport,dport,sw_if_index,fib_index,acl_index,rule_index,
+  action,dir,src,dst,count,duration_ms,bytes_in,bytes_out,pkts_in,pkts_out,
+  rule_tag,reason
+rule_tag is the matched ACL's VPP tag (fw:pol:<id>, zone-auto:...), empty for
+the implicit deny (acl_index 4294967295). It names the rule even after VPP
+reassigns ACL indices.
+
+ACL scope: "dp-log acl all-deny on" logs every drop, the implicit deny
+included. "unmatched" alone logs only the implicit deny.

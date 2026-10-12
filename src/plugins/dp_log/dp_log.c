@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
@@ -122,6 +123,54 @@ typedef struct
   u64 drops;
 } dp_log_sess_ring_t;
 
+/* One output file, as the writer sees it.
+ *
+ * A firewall log that has gaps must say so in the log itself: the person
+ * reading acl_logs.log after an incident cannot see the stats segment as it
+ * was then. So everything that keeps a row out of the file -- a full ring,
+ * a failed write(), a disk below min-free-mb -- is counted here and written
+ * back into the file as a "lost" row once the file takes writes again.
+ *
+ * Writer-thread only, except write_lost and disk_low, which the main thread
+ * reads (atomically) for the stats gauges and "show dp-log". */
+/* Why rows went missing. Each is reported as its own row, because each
+   calls for a different fix: a bigger ring, a working disk, more space. */
+enum
+{
+  DP_LOG_LOSS_MATCH_RING,   /* ACL match ring full (dns: the DNS ring) */
+  DP_LOG_LOSS_SESSION_RING, /* session record ring full (acl file only) */
+  DP_LOG_LOSS_WRITE,	    /* write () failed, or the file was not open */
+  DP_LOG_LOSS_DISK,	    /* skipped: filesystem below min-free-mb */
+  DP_LOG_N_LOSS,
+};
+
+/* One cause's unreported loss, with what it takes to say exactly why. */
+typedef struct
+{
+  u64 rows;
+  u64 since_ns; /* CLOCK_REALTIME the loss began; 0 = nothing pending */
+  u64 threads;	/* ring causes: bitmap of VPP threads whose ring was full */
+  int err;	/* write cause: errno of the last failure; 0 = file not open */
+  u64 free_mb;	/* disk cause: free space when last checked */
+} dp_log_loss_t;
+
+typedef struct
+{
+  int *fd;	    /* &dp_log_main.fd or &dp_log_main.dns_fd */
+  const char *name; /* for diagnostics: "acl" or "dns" */
+
+  /* Pending loss per cause, reset once reported. */
+  dp_log_loss_t loss[DP_LOG_N_LOSS];
+  u64 free_mb; /* free space on the log's filesystem, last checked */
+
+  u64 write_lost; /* cumulative lost_write + lost_disk, for the gauge */
+  u8 disk_low;
+  u8 torn;	  /* a partial write left half a row; start a new line */
+  int last_errno; /* last errno warned about, so each is warned once */
+} dp_log_sink_t;
+
+#define DP_LOG_MIN_FREE_MB_DEFAULT 1024
+
 typedef struct
 {
 
@@ -165,6 +214,17 @@ typedef struct
      thread, 1 Hz), never from the writer pthread. */
   u32 acl_drops_idx, dns_drops_idx, acl_depth_idx, dns_depth_idx;
   u32 sess_drops_idx, sess_depth_idx;
+  u32 acl_write_lost_idx, dns_write_lost_idx;
+
+  /* Below this much free space on a log's filesystem the writer stops
+     writing to it and counts what it skips. The logs live on the root
+     filesystem, and a flood that fills / takes the box down with the log.
+     MB; 0 disables. min_free_set tells "0" apart from "not configured",
+     because the default is applied by the writer, not at config time. */
+  u32 min_free_mb;
+  u8 min_free_set;
+
+  dp_log_sink_t acl_sink, dns_sink;
 
   pthread_t writer_thread;
   volatile int stop;
@@ -345,6 +405,23 @@ dp_log_refresh_stats (vlib_main_t *vm)
   vlib_stats_set_gauge (lm->acl_depth_idx, adepth);
   vlib_stats_set_gauge (lm->dns_depth_idx, ddepth);
   vlib_stats_set_gauge (lm->sess_depth_idx, sdepth);
+
+  u64 awl = __atomic_load_n (&lm->acl_sink.write_lost, __ATOMIC_RELAXED);
+  u64 dwl = __atomic_load_n (&lm->dns_sink.write_lost, __ATOMIC_RELAXED);
+  vlib_stats_set_gauge (lm->acl_write_lost_idx, awl);
+  vlib_stats_set_gauge (lm->dns_write_lost_idx, dwl);
+  if (vm)
+    vlib_cli_output (
+      vm, "  write lost: acl %llu%s  dns %llu%s  (min-free %u MB)",
+      (unsigned long long) awl,
+      __atomic_load_n (&lm->acl_sink.disk_low, __ATOMIC_RELAXED) ?
+	" [DISK LOW]" :
+	"",
+      (unsigned long long) dwl,
+      __atomic_load_n (&lm->dns_sink.disk_low, __ATOMIC_RELAXED) ?
+	" [DISK LOW]" :
+	"",
+      lm->min_free_set ? lm->min_free_mb : DP_LOG_MIN_FREE_MB_DEFAULT);
 }
 
 static uword
@@ -431,14 +508,8 @@ dp_log_sess_enq (u32 thread_index, const dp_log_sess_event_t *ev)
 }
 
 static inline void
-dp_log_format_wall_time_ms (char *dst, size_t dst_sz, const dp_log_main_t *lm,
-			    u64 ev_ts_ns)
+dp_log_format_wall_ns (char *dst, size_t dst_sz, u64 wall_ns)
 {
-  /* Convert event ts (ns since VPP start) into wall-clock ns */
-  u64 wall_ns = lm->wall_base_ns;
-  if (ev_ts_ns >= lm->ts_base_ns)
-    wall_ns += (ev_ts_ns - lm->ts_base_ns);
-
   time_t sec = (time_t) (wall_ns / 1000000000ULL);
   u32 msec = (u32) ((wall_ns % 1000000000ULL) / 1000000ULL);
 
@@ -449,6 +520,313 @@ dp_log_format_wall_time_ms (char *dst, size_t dst_sz, const dp_log_main_t *lm,
   (void) snprintf (dst, dst_sz, "%04d-%02d-%02d %02d:%02d:%02d.%03u",
 		   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
 		   tm.tm_min, tm.tm_sec, msec);
+}
+
+static inline void
+dp_log_format_wall_time_ms (char *dst, size_t dst_sz, const dp_log_main_t *lm,
+			    u64 ev_ts_ns)
+{
+  /* Convert event ts (ns since VPP start) into wall-clock ns */
+  u64 wall_ns = lm->wall_base_ns;
+  if (ev_ts_ns >= lm->ts_base_ns)
+    wall_ns += (ev_ts_ns - lm->ts_base_ns);
+
+  dp_log_format_wall_ns (dst, dst_sz, wall_ns);
+}
+
+static u64
+dp_log_realtime_ns (void)
+{
+  struct timespec ts;
+  clock_gettime (CLOCK_REALTIME, &ts);
+  return (u64) ts.tv_sec * 1000000000ULL + (u64) ts.tv_nsec;
+}
+
+/* ----------------------- Output sinks ----------------------- */
+
+/* write() until done. Returns the number of bytes written, which is short
+   of len only on a real error (errno is then set). */
+static size_t
+dp_log_write_all (int fd, const char *buf, size_t len)
+{
+  size_t done = 0;
+  while (done < len)
+    {
+      ssize_t n = write (fd, buf + done, len - done);
+      if (n < 0)
+	{
+	  if (errno == EINTR)
+	    continue;
+	  return done;
+	}
+      if (n == 0)
+	{
+	  errno = EIO;
+	  return done;
+	}
+      done += (size_t) n;
+    }
+  return done;
+}
+
+static u64
+dp_log_count_rows (const char *buf, size_t len)
+{
+  u64 n = 0;
+  for (size_t i = 0; i < len; i++)
+    n += buf[i] == '\n';
+  return n;
+}
+
+/* since_ns is when the loss happened, if the caller knows better than
+   "now" -- ring drops are only noticed on the next tick. 0 means now. */
+static dp_log_loss_t *
+dp_log_sink_note_loss (dp_log_sink_t *s, int cause, u64 rows, u64 since_ns)
+{
+  dp_log_loss_t *l = &s->loss[cause];
+  if (rows == 0)
+    return l;
+  if (l->since_ns == 0)
+    l->since_ns = since_ns ? since_ns : dp_log_realtime_ns ();
+  l->rows += rows;
+  return l;
+}
+
+/* Rows dropped on the write side: a failed write (err), a closed file
+   (err 0) or a disk below min-free-mb. All count toward the gauge. */
+static void
+dp_log_sink_lose_rows (dp_log_sink_t *s, u64 rows, int err)
+{
+  dp_log_loss_t *l;
+
+  if (s->disk_low)
+    {
+      l = dp_log_sink_note_loss (s, DP_LOG_LOSS_DISK, rows, 0);
+      l->free_mb = s->free_mb;
+    }
+  else
+    {
+      l = dp_log_sink_note_loss (s, DP_LOG_LOSS_WRITE, rows, 0);
+      l->err = err;
+    }
+  __atomic_add_fetch (&s->write_lost, rows, __ATOMIC_RELAXED);
+}
+
+/* A write failed with errno. Warn once per distinct errno, and drop the
+   descriptor unless the failure is about space: ENOSPC and EDQUOT clear by
+   themselves, anything else (EIO, EBADF, ESTALE) wants a fresh open, which
+   the writer loop does for a descriptor that is -1. */
+static void
+dp_log_sink_failed (dp_log_sink_t *s, int err)
+{
+  if (err != s->last_errno)
+    {
+      dp_log_warn ("%s log write failed: %s; rows are being lost", s->name,
+		   strerror (err));
+      s->last_errno = err;
+    }
+  if (err != ENOSPC && err != EDQUOT && *s->fd >= 0)
+    {
+      close (*s->fd);
+      *s->fd = -1;
+    }
+}
+
+/* Write a buffer of whole rows, or count them as lost. Every data write in
+   the writer goes through here; nothing calls write () on a log directly. */
+static void
+dp_log_sink_write (dp_log_sink_t *s, const char *buf, int len)
+{
+  if (len <= 0)
+    return;
+
+  if (*s->fd < 0 || s->disk_low)
+    {
+      dp_log_sink_lose_rows (s, dp_log_count_rows (buf, (size_t) len), 0);
+      return;
+    }
+
+  /* A short write left the last row half-written. End it, so this buffer's
+     first row is not glued onto the fragment. */
+  if (s->torn)
+    {
+      if (dp_log_write_all (*s->fd, "\n", 1) != 1)
+	{
+	  int err = errno;
+	  dp_log_sink_lose_rows (s, dp_log_count_rows (buf, (size_t) len), err);
+	  dp_log_sink_failed (s, err);
+	  return;
+	}
+      s->torn = 0;
+    }
+
+  size_t done = dp_log_write_all (*s->fd, buf, (size_t) len);
+  if (done == (size_t) len)
+    {
+      s->last_errno = 0;
+      return;
+    }
+
+  int err = errno;
+  /* Rows that never fully reached the file. A row cut in half counts as
+     lost: what is on disk of it cannot be parsed. */
+  u64 rows = dp_log_count_rows (buf + done, (size_t) len - done);
+  if (done > 0 && buf[done - 1] != '\n')
+    s->torn = 1;
+  dp_log_sink_lose_rows (s, rows, err);
+  dp_log_sink_failed (s, err);
+}
+
+/* Once a second: is the filesystem under this log below min-free-mb?
+   Checked on the open descriptor, so it is the filesystem actually being
+   written, whatever the path now points at. */
+static void
+dp_log_sink_check_disk (dp_log_main_t *lm, dp_log_sink_t *s)
+{
+  u64 min_mb = lm->min_free_set ? lm->min_free_mb : DP_LOG_MIN_FREE_MB_DEFAULT;
+  struct statvfs vfs;
+  u8 low;
+
+  if (*s->fd < 0 || fstatvfs (*s->fd, &vfs) != 0)
+    low = 0;
+  else
+    {
+      s->free_mb = ((u64) vfs.f_bavail * (u64) vfs.f_frsize) >> 20;
+      low = min_mb != 0 && s->free_mb < min_mb;
+    }
+
+  if (low != s->disk_low)
+    {
+      if (low)
+	dp_log_warn ("%s log: less than %llu MB free; not writing until "
+		     "space is freed (rows are counted as lost)",
+		     s->name, (unsigned long long) min_mb);
+      else
+	dp_log_warn ("%s log: disk space recovered; writing again", s->name);
+      __atomic_store_n (&s->disk_low, low, __ATOMIC_RELAXED);
+    }
+}
+
+/* Say exactly why one cause lost rows, in words an operator can act on.
+   No commas: this lands in a CSV field. */
+static void
+dp_log_loss_reason (char *dst, size_t sz, const dp_log_main_t *lm,
+		    const dp_log_sink_t *s, int cause, const dp_log_loss_t *l)
+{
+  char threads[128];
+  int o = 0;
+
+  threads[0] = 0;
+  for (u32 t = 0; t < 64 && o < (int) sizeof (threads) - 4; t++)
+    if (l->threads & (1ULL << t))
+      o += snprintf (threads + o, sizeof (threads) - o, "%s%u", o ? " " : "",
+		     t);
+
+  switch (cause)
+    {
+    case DP_LOG_LOSS_MATCH_RING:
+      snprintf (dst, sz,
+		"%s ring full on thread %s (%u entries per thread): the writer "
+		"could not keep up",
+		s == &lm->dns_sink ? "dns" : "acl match", threads,
+		s == &lm->dns_sink ? lm->dns_ring_size : lm->ring_size);
+      break;
+    case DP_LOG_LOSS_SESSION_RING:
+      snprintf (dst, sz,
+		"session ring full on thread %s (%u entries per thread): too "
+		"many sessions opened or closed at once",
+		threads, lm->sess_ring_size);
+      break;
+    case DP_LOG_LOSS_WRITE:
+      if (l->err)
+	snprintf (dst, sz, "write to log file failed: %s", strerror (l->err));
+      else
+	snprintf (dst, sz, "log file was not open");
+      break;
+    case DP_LOG_LOSS_DISK:
+      snprintf (dst, sz,
+		"disk nearly full: %llu MB free is below min-free-mb %u",
+		(unsigned long long) l->free_mb,
+		lm->min_free_set ? lm->min_free_mb : DP_LOG_MIN_FREE_MB_DEFAULT);
+      break;
+    }
+
+  for (char *c = dst; *c; c++)
+    if (*c == ',' || *c == '"' || *c == '\n' || *c == '\r')
+      *c = ';';
+}
+
+/* Write the pending loss into the log as rows of its own, then forget it.
+ *
+ * A row per cause, so "the dataplane outran the writer" and "the disk was
+ * full" read differently. count says how many rows are missing, duration_ms
+ * how long the gap ran, reason why. If the file still cannot be written the
+ * loss stays pending and is retried next tick. */
+static void
+dp_log_sink_report (dp_log_main_t *lm, dp_log_sink_t *s, int is_dns)
+{
+  /* The kind column for each cause. The DNS file has one ring. */
+  static const char *const acl_kind[DP_LOG_N_LOSS] = {
+    "lost_match_ring", "lost_session_ring", "lost_write", "lost_disk"
+  };
+  static const char *const dns_cause[DP_LOG_N_LOSS] = { "ring", "ring",
+							"write", "disk" };
+  char buf[2048], ts[32], reason[256];
+  int len = 0, any = 0;
+
+  if (*s->fd < 0 || s->disk_low)
+    return;
+
+  u64 now = dp_log_realtime_ns ();
+  dp_log_format_wall_ns (ts, sizeof (ts), now);
+
+  for (int c = 0; c < DP_LOG_N_LOSS; c++)
+    {
+      dp_log_loss_t *l = &s->loss[c];
+      if (l->rows == 0)
+	continue;
+      any = 1;
+      f64 dur_ms =
+	now > l->since_ns ? (f64) (now - l->since_ns) / 1e6 : 0;
+      dp_log_loss_reason (reason, sizeof (reason), lm, s, c, l);
+      if (is_dns)
+	/* ts,client,name,blocked,answer,reason: client "lost", the cause
+	   where the name goes, the count where an answer would. */
+	len += snprintf (buf + len, sizeof (buf) - len,
+			 "%s,lost,%s,0,%llu,%s\n", ts, dns_cause[c],
+			 (unsigned long long) l->rows, reason);
+      else
+	/* kind lost_<cause>; count, duration_ms and reason filled. */
+	len += snprintf (buf + len, sizeof (buf) - len,
+			 "%s,%s,,,,,,,,,,,,,%llu,%.3f,,,,,,%s\n", ts,
+			 acl_kind[c], (unsigned long long) l->rows, dur_ms,
+			 reason);
+    }
+  if (!any)
+    return;
+
+  if (s->torn)
+    {
+      if (dp_log_write_all (*s->fd, "\n", 1) != 1)
+	{
+	  dp_log_sink_failed (s, errno);
+	  return;
+	}
+      s->torn = 0;
+    }
+
+  /* Not through dp_log_sink_write: a report that fails must stay pending,
+     not be counted as one more lost row. */
+  size_t done = dp_log_write_all (*s->fd, buf, (size_t) len);
+  if (done != (size_t) len)
+    {
+      if (done > 0 && buf[done - 1] != '\n')
+	s->torn = 1;
+      dp_log_sink_failed (s, errno);
+      return;
+    }
+
+  clib_memset (s->loss, 0, sizeof (s->loss));
 }
 
 /* ----------------------- Writer thread ----------------------- */
@@ -503,6 +881,17 @@ dp_log_reopen_if_replaced (int *fd, const u8 *path)
     }
 }
 
+/* Owner read-write, group read, nobody else. The logs name every client
+ * and, for DNS, every name it looked up. open ()'s mode only applies to a
+ * file it creates, so a log left 0644 by an older build is tightened here
+ * too. */
+static void
+dp_log_restrict_mode (int fd, const char *path)
+{
+  if (fchmod (fd, 0640) != 0)
+    dp_log_warn ("chmod(%s) failed: %s", path, strerror (errno));
+}
+
 static int
 dp_log_open_file (dp_log_main_t *lm)
 {
@@ -524,12 +913,13 @@ dp_log_open_file (dp_log_main_t *lm)
       file_size = st.st_size;
     }
 
-  lm->fd = open (p, O_CREAT | O_WRONLY | O_APPEND, 0644);
+  lm->fd = open (p, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0640);
   if (lm->fd < 0)
     {
       dp_log_warn ("open(%s) failed: %s", p, strerror (errno));
       return -1;
     }
+  dp_log_restrict_mode (lm->fd, p);
 
   //   clib_warning ("dp_log: opened file %s (exists=%d, size=%ld)", p,
   //   file_exists, file_size);
@@ -546,9 +936,8 @@ dp_log_open_file (dp_log_main_t *lm)
       const char *hdr =
 	"ts,kind,is_ip6,proto,sport,dport,sw_if_index,fib_index,acl_index,"
 	"rule_index,action,dir,src,dst,count,duration_ms,bytes_in,bytes_out,"
-	"pkts_in,pkts_out\n";
-      /*ssize_t hdr_written = */
-      (void) write (lm->fd, hdr, (int) strlen (hdr));
+	"pkts_in,pkts_out,rule_tag,reason\n";
+      (void) dp_log_write_all (lm->fd, hdr, strlen (hdr));
       //   clib_warning ("dp_log: wrote header, %ld bytes", hdr_written);
     }
 
@@ -570,17 +959,18 @@ dp_log_open_dns_file (dp_log_main_t *lm)
   if (stat (p, &st) == 0)
     file_size = st.st_size;
 
-  lm->dns_fd = open (p, O_CREAT | O_WRONLY | O_APPEND, 0644);
+  lm->dns_fd = open (p, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0640);
   if (lm->dns_fd < 0)
     {
       dp_log_warn ("open(%s) failed: %s", p, strerror (errno));
       return -1;
     }
+  dp_log_restrict_mode (lm->dns_fd, p);
 
   if (file_size == 0)
     {
-      const char *hdr = "ts,client,name,blocked,answer\n";
-      (void) write (lm->dns_fd, hdr, (int) strlen (hdr));
+      const char *hdr = "ts,client,name,blocked,answer,reason\n";
+      (void) dp_log_write_all (lm->dns_fd, hdr, strlen (hdr));
     }
 
   return 0;
@@ -787,13 +1177,29 @@ dp_log_agg_lookup (dp_log_agg_event_t *slots, u32 cap, u32 *n,
  * duration_ms reaches back to its first, and the volume sits in the column
  * for the arc it was seen on. A packet written through on overflow is just
  * a flow of one -- same columns, count=1, duration 0. */
+/* An ACL tag as a CSV field. Tags are set over the API, so anything that
+   would break the row (or forge a column) is replaced, like DNS names. */
+static void
+dp_log_format_tag (char *dst, size_t dst_sz, const u8 *tag)
+{
+  size_t o = 0;
+  for (size_t i = 0; i < DP_LOG_TAG_MAX && tag[i] && o + 1 < dst_sz; i++)
+    {
+      u8 c = tag[i];
+      if (c < 0x20 || c > 0x7e || c == ',' || c == '"')
+	c = '_';
+      dst[o++] = (char) c;
+    }
+  dst[o] = 0;
+}
+
 static void
 dp_log_write_acl_row (dp_log_main_t *lm, char *out, int *out_len, int cap,
 		      const dp_log_acl_event_t *ev, u64 count, u64 bytes,
 		      u64 first_ts_ns)
 {
   char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN], ts[32], line[512];
-  char vol[96];
+  char vol[96], tag[DP_LOG_TAG_MAX];
   int len;
   f64 dur_ms = first_ts_ns && ev->ts_ns > first_ts_ns ?
 		 (f64) (ev->ts_ns - first_ts_ns) / 1e6 :
@@ -804,6 +1210,7 @@ dp_log_write_acl_row (dp_log_main_t *lm, char *out, int *out_len, int cap,
   if (!dp_log_format_ip (dst, sizeof (dst), ev, 0))
     clib_strncpy (dst, "?", sizeof (dst));
   dp_log_format_wall_time_ms (ts, sizeof (ts), lm, ev->ts_ns);
+  dp_log_format_tag (tag, sizeof (tag), ev->tag);
 
   /* bytes_in,bytes_out,pkts_in,pkts_out -- one side only: a denied or
      stateless flow is seen in the one direction it was evaluated in. */
@@ -815,19 +1222,20 @@ dp_log_write_acl_row (dp_log_main_t *lm, char *out, int *out_len, int cap,
 	      (unsigned long long) count);
 
   len = snprintf (line, sizeof (line),
-		  "%s,match,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s,%llu,%.3f,%s\n",
+		  "%s,match,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s,%llu,%.3f,%s,%s,"
+		  "\n",
 		  ts, (unsigned) ev->is_ip6, (unsigned) ev->proto,
 		  (unsigned) ev->sport, (unsigned) ev->dport,
 		  (unsigned) ev->sw_if_index, (unsigned) ev->fib_index,
 		  (unsigned) ev->acl_index, (unsigned) ev->rule_index,
 		  (unsigned) ev->action, ev->is_input ? "in" : "out", src, dst,
-		  (unsigned long long) count, dur_ms, vol);
+		  (unsigned long long) count, dur_ms, vol, tag);
   if (len <= 0)
     return;
 
   if (*out_len + len > cap)
     {
-      (void) write (lm->fd, out, *out_len);
+      dp_log_sink_write (&lm->acl_sink, out, *out_len);
       *out_len = 0;
     }
   clib_memcpy_fast (out + *out_len, line, len);
@@ -944,6 +1352,24 @@ dp_log_writer_thread_fn (void *arg)
     FLUSH_INTERVAL_MS = 1000
   };
 
+  /* Ring drop counts already turned into lost rows, per thread. The ACL
+     match and session rings both feed acl_logs.log. */
+  u64 *seen_acl = calloc (lm->n_threads, sizeof (u64));
+  u64 *seen_sess = calloc (lm->n_threads, sizeof (u64));
+  u64 *seen_dns = calloc (lm->n_threads, sizeof (u64));
+  if (!seen_acl || !seen_sess || !seen_dns)
+    {
+      dp_log_warn ("writer thread could not allocate; logging off");
+      free (seen_acl);
+      free (seen_sess);
+      free (seen_dns);
+      free (out);
+      free (agg_slots);
+      free (agg_spare);
+      return 0;
+    }
+
+  u64 prev_tick_ns = dp_log_realtime_ns ();
   int loop_count = 0;
 
   while (!lm->stop)
@@ -966,6 +1392,43 @@ dp_log_writer_thread_fn (void *arg)
 	  {
 	    dp_log_reopen_if_replaced (&lm->fd, lm->path);
 	    dp_log_reopen_if_replaced (&lm->dns_fd, lm->dns_path);
+	    dp_log_sink_check_disk (lm, &lm->acl_sink);
+	    dp_log_sink_check_disk (lm, &lm->dns_sink);
+
+	    /* Drops found now happened at some point since the last tick, so
+	       that is when the gap is said to begin. */
+	    u64 tick_ns = dp_log_realtime_ns ();
+	    for (u32 ti = 0; ti < lm->n_threads; ti++)
+	      {
+		u64 a = __atomic_load_n (&lm->rings[ti].drops, __ATOMIC_RELAXED);
+		u64 s =
+		  __atomic_load_n (&lm->sess_rings[ti].drops, __ATOMIC_RELAXED);
+		u64 d =
+		  __atomic_load_n (&lm->dns_rings[ti].drops, __ATOMIC_RELAXED);
+		u64 bit = ti < 64 ? 1ULL << ti : 0;
+		if (a != seen_acl[ti])
+		  dp_log_sink_note_loss (&lm->acl_sink, DP_LOG_LOSS_MATCH_RING,
+					 a - seen_acl[ti], prev_tick_ns)
+		    ->threads |= bit;
+		if (s != seen_sess[ti])
+		  dp_log_sink_note_loss (&lm->acl_sink,
+					 DP_LOG_LOSS_SESSION_RING,
+					 s - seen_sess[ti], prev_tick_ns)
+		    ->threads |= bit;
+		if (d != seen_dns[ti])
+		  dp_log_sink_note_loss (&lm->dns_sink, DP_LOG_LOSS_MATCH_RING,
+					 d - seen_dns[ti], prev_tick_ns)
+		    ->threads |= bit;
+		seen_acl[ti] = a;
+		seen_sess[ti] = s;
+		seen_dns[ti] = d;
+	      }
+	    prev_tick_ns = tick_ns;
+
+	    /* Reports wait for an open, writable file; until then the loss
+	       stays pending, so a gap is never silently forgotten. */
+	    dp_log_sink_report (lm, &lm->acl_sink, 0);
+	    dp_log_sink_report (lm, &lm->dns_sink, 1);
 	    last_stat = tnow;
 	  }
       }
@@ -1029,12 +1492,13 @@ dp_log_writer_thread_fn (void *arg)
 	      while (n < 1024 && dp_log_sess_ring_try_deq (r, &ev))
 		{
 		  char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
-		  char ts[32];
+		  char ts[32], tag[DP_LOG_TAG_MAX];
 		  char line[512];
 
 		  did_work = 1;
 		  n++;
 
+		  dp_log_format_tag (tag, sizeof (tag), ev.tag);
 		  if (!dp_log_format_sess_ip (src, sizeof (src), &ev, 1))
 		    clib_strncpy (src, "?", sizeof (src));
 		  if (!dp_log_format_sess_ip (dst, sizeof (dst), &ev, 0))
@@ -1055,7 +1519,7 @@ dp_log_writer_thread_fn (void *arg)
 		  int len = snprintf (
 		    line, sizeof (line),
 		    "%s,%s,%u,%u,%u,%u,%u,0,%u,%u,2,%s,%s,%s,,%.3f,%llu,%llu,"
-		    "%u,%u\n",
+		    "%u,%u,%s,\n",
 		    ts,
 		    ev.kind == DP_LOG_SESS_CLOSE ? "close" : "open",
 		    (unsigned) ev.is_ip6, (unsigned) ev.proto,
@@ -1065,13 +1529,13 @@ dp_log_writer_thread_fn (void *arg)
 		    dst, (double) ev.duration_ns / 1e6,
 		    (unsigned long long) ev.bytes[1],
 		    (unsigned long long) ev.bytes[0], (unsigned) ev.packets[1],
-		    (unsigned) ev.packets[0]);
+		    (unsigned) ev.packets[0], tag);
 		  if (len <= 0)
 		    continue;
 
 		  if (sess_len + len > (int) sizeof (sess_out))
 		    {
-		      (void) write (lm->fd, sess_out, sess_len);
+		      dp_log_sink_write (&lm->acl_sink, sess_out, sess_len);
 		      sess_len = 0;
 		    }
 		  clib_memcpy_fast (sess_out + sess_len, line, len);
@@ -1080,7 +1544,7 @@ dp_log_writer_thread_fn (void *arg)
 	    }
 
 	  if (sess_len > 0)
-	    (void) write (lm->fd, sess_out, sess_len);
+	    dp_log_sink_write (&lm->acl_sink, sess_out, sess_len);
 	}
 
       /* ---- DNS queries: written straight through, no aggregation ---- */
@@ -1151,7 +1615,7 @@ dp_log_writer_thread_fn (void *arg)
 
 		  if (dns_len + len > (int) sizeof (dns_out))
 		    {
-		      (void) write (lm->dns_fd, dns_out, dns_len);
+		      dp_log_sink_write (&lm->dns_sink, dns_out, dns_len);
 		      dns_len = 0;
 		    }
 		  clib_memcpy_fast (dns_out + dns_len, line, len);
@@ -1160,7 +1624,7 @@ dp_log_writer_thread_fn (void *arg)
 	    }
 
 	  if (dns_len > 0)
-	    (void) write (lm->dns_fd, dns_out, dns_len);
+	    dp_log_sink_write (&lm->dns_sink, dns_out, dns_len);
 	}
 
       if (!acl_on)
@@ -1172,7 +1636,7 @@ dp_log_writer_thread_fn (void *arg)
 	      dp_log_agg_expire (lm, out, &out_len, OUTBUF_SZ, agg_slots,
 				 agg_spare, AGG_CAP, &agg_count, 0, 1);
 	      if (out_len > 0)
-		(void) write (lm->fd, out, out_len);
+		dp_log_sink_write (&lm->acl_sink, out, out_len);
 	      out_len = 0;
 	    }
 	  if (!did_work)
@@ -1235,7 +1699,7 @@ dp_log_writer_thread_fn (void *arg)
 	  /* Flush buffer: overflow rows and expired flows alike. */
 	  if (out_len > 0)
 	    {
-	      (void) write (lm->fd, out, out_len);
+	      dp_log_sink_write (&lm->acl_sink, out, out_len);
 	      out_len = 0;
 	    }
 
@@ -1264,10 +1728,15 @@ dp_log_writer_thread_fn (void *arg)
 	dp_log_agg_expire (lm, out, &out_len, OUTBUF_SZ, agg_slots, agg_spare,
 			   AGG_CAP, &agg_count, 0, 1);
       if (out_len > 0)
-	(void) write (lm->fd, out, out_len);
+	dp_log_sink_write (&lm->acl_sink, out, out_len);
     }
+  dp_log_sink_report (lm, &lm->acl_sink, 0);
+  dp_log_sink_report (lm, &lm->dns_sink, 1);
 
   /* Clean up */
+  free (seen_acl);
+  free (seen_sess);
+  free (seen_dns);
   free (agg_spare);
   free (agg_slots);
   free (out);
@@ -1329,6 +1798,8 @@ dp_log_config (vlib_main_t *vm, unformat_input_t *input)
 	;
       else if (unformat (input, "dns-ring-size %u", &lm->dns_ring_size))
 	;
+      else if (unformat (input, "min-free-mb %u", &lm->min_free_mb))
+	lm->min_free_set = 1;
       else if (unformat (input, "acl-log-unmatched"))
 	__atomic_fetch_or (&dp_log_acl_flags, DP_LOG_ACL_F_UNMATCHED,
 			   __ATOMIC_RELAXED);
@@ -1473,6 +1944,13 @@ dp_log_init (vlib_main_t *vm)
   lm->dns_depth_idx = vlib_stats_add_gauge ("/dp-log/dns/ring-depth");
   lm->sess_drops_idx = vlib_stats_add_gauge ("/dp-log/session/drops");
   lm->sess_depth_idx = vlib_stats_add_gauge ("/dp-log/session/ring-depth");
+  lm->acl_write_lost_idx = vlib_stats_add_gauge ("/dp-log/acl/write-lost");
+  lm->dns_write_lost_idx = vlib_stats_add_gauge ("/dp-log/dns/write-lost");
+
+  lm->acl_sink.fd = &lm->fd;
+  lm->acl_sink.name = "acl";
+  lm->dns_sink.fd = &lm->dns_fd;
+  lm->dns_sink.name = "dns";
 
   lm->stop = 0;
   if (pthread_create (&lm->writer_thread, 0, dp_log_writer_thread_fn, lm) != 0)

@@ -398,6 +398,7 @@ acl_log_session (fa_session_t *sess, u32 sw_if_index, u8 kind)
   ev.sw_if_index = sw_if_index;
   ev.acl_index = sess->log_acl_index;
   ev.rule_index = sess->log_rule_index;
+  acl_copy_log_tag (&acl_main, ev.acl_index, ev.tag, sizeof (ev.tag));
   ev.bytes[0] = sess->total_bytes[0];
   ev.bytes[1] = sess->total_bytes[1];
   ev.packets[0] = sess->total_packets[0];

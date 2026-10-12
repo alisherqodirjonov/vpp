@@ -9,6 +9,10 @@
 extern "C" {
 #endif
 
+/* An ACL tag as VPP stores it (acl_list_t.tag): NUL-terminated, at most 63
+   characters. */
+#define DP_LOG_TAG_MAX 64
+
 /* Fixed-size POD event (NO pointers). */
 typedef struct
 {
@@ -40,6 +44,14 @@ typedef struct
     struct { ip4_address_t src, dst; } v4;
     struct { ip6_address_t src, dst; } v6;
   } ip;
+
+  /* The matched ACL's tag (fw:pol:<id>, zone-auto:..., ...), copied when
+     the packet is evaluated; empty for the implicit deny, where no ACL
+     matched. acl_index alone cannot name a rule: VPP reassigns pool indices
+     on restart and on re-apply, so an archived row would point at whatever
+     ACL holds that index today. The tag is what the operator configured and
+     does not move. */
+  u8 tag[DP_LOG_TAG_MAX];
 } dp_log_acl_event_t;
 
 /* ------------------------------ DNS queries ------------------------------
@@ -131,6 +143,11 @@ typedef struct
     struct { ip4_address_t src, dst; } v4;
     struct { ip6_address_t src, dst; } v6;
   } ip;
+
+  /* Tag of the ACL that opened the session; same reasoning as the match
+     event. Read when the record is emitted, so an ACL deleted while the
+     session lived leaves it empty rather than naming its successor. */
+  u8 tag[DP_LOG_TAG_MAX];
 } dp_log_sess_event_t;
 
 /* ------------------------- ACL log scope ---------------------------------
@@ -146,10 +163,13 @@ typedef struct
  *              so no rule can carry a flag, yet "what is my firewall
  *              dropping that I never wrote a rule for" is the single most
  *              useful question the log answers.
- *   ALL_DENY   log every denied packet regardless of the rule's flag. This
- *              is what the logger did before per-rule flags existed; kept
- *              so that behaviour stays reachable rather than silently
- *              disappearing under an upgrade.
+ *   ALL_DENY   log every denied packet regardless of the rule's flag,
+ *              INCLUDING the implicit deny. "Every" has to mean every: a
+ *              spoofed-source flood matches no rule at all, so without
+ *              this it falls through to the implicit deny and leaves no
+ *              trace for the operator who asked to see every drop. So
+ *              ALL_DENY implies UNMATCHED; UNMATCHED alone logs just the
+ *              implicit deny.
  *
  * Shared by both halves below: the owner writes these bits, consumers read
  * them, and a value that meant different things on either side of the

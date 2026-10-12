@@ -672,8 +672,10 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 		  else
 		    /* The implicit deny at the end of the list. No rule
 		       matched, so no rule can carry a flag; this one is
-		       governed globally or not at all. */
-		    want_log = (scope & DP_LOG_ACL_F_UNMATCHED) != 0;
+		       governed globally or not at all. It is a deny, so
+		       ALL_DENY covers it too -- see dp_log.h. */
+		    want_log = (scope & (DP_LOG_ACL_F_UNMATCHED
+					 | DP_LOG_ACL_F_ALL_DENY)) != 0;
 
 		  if (PREDICT_FALSE (want_log))
 		    {
@@ -696,6 +698,8 @@ acl_fa_inner_node_fn (vlib_main_t * vm,
 			  ev.fib_index = vnet_buffer (b[0])->ip.fib_index;
 			  ev.acl_index = is_match ? match_acl_in_index : ~0;
 			  ev.rule_index = is_match ? match_rule_index : ~0;
+			  acl_copy_log_tag (am, ev.acl_index, ev.tag,
+					    sizeof (ev.tag));
 			  ev.action = (u8) action;
 			  /* Input and output ACLs are different policies and
 			     a log that conflates them cannot be read. */

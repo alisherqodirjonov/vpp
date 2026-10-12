@@ -320,6 +320,24 @@ typedef struct {
    translation units means one dp_log handle rather than four. */
 void acl_log_session (fa_session_t *sess, u32 sw_if_index, u8 kind);
 
+/* Copy an ACL's tag into a log event, so the log names the rule by what the
+   operator configured rather than by a pool index VPP may reuse. Empty when
+   the index names no live ACL: the implicit deny (~0), or an ACL deleted
+   since. Safe on a worker: ACLs change only under the worker barrier. */
+always_inline void
+acl_copy_log_tag (acl_main_t *am, u32 acl_index, u8 *dst, u32 dst_len)
+{
+  if (acl_index >= vec_len (am->acls) ||
+      pool_is_free_index (am->acls, acl_index))
+    {
+      dst[0] = 0;
+      return;
+    }
+  clib_memcpy_fast (dst, am->acls[acl_index].tag,
+		    clib_min (dst_len, sizeof (am->acls[acl_index].tag)));
+  dst[dst_len - 1] = 0;
+}
+
 #define acl_log_err(...) \
   vlib_log(VLIB_LOG_LEVEL_ERR, acl_main.log_default, __VA_ARGS__)
 #define acl_log_warn(...) \
