@@ -66,6 +66,29 @@ vnet_policer_police (vlib_main_t *vm, vlib_buffer_t *b, u32 policer_index,
   policer_t *pol;
   vnet_policer_main_t *pm = &vnet_policer_main;
 
+  /* SARHAD-LOCAL: ~0 means "no policer bound".
+   *
+   * policer_input() writes that sentinel into
+   * policer_index_by_sw_if_index[dir][sw_if_index] when a policer is detached,
+   * and then disables the feature arc — but disabling an arc cannot un-enqueue
+   * a frame already pending for this node. A worker parked at the API barrier
+   * with a policer-input frame outstanding dispatches it the instant the
+   * barrier releases, by which time the slot reads ~0.
+   *
+   * Nothing on the read side ever checked it: vnet_policer_inline passes the
+   * slot straight here (node_funcs.c:126/127/210) and this function indexed
+   * the pool with it, so pol pointed 4 GB past pm->policers and the first
+   * dereference below faulted. Detaching a policer from an interface with
+   * traffic in flight was therefore a coin-flip SIGSEGV in a worker thread —
+   * observed 2026-10-09, policer_index=4294967295 at police_inlines.h:77.
+   *
+   * Treat it as "not policed" and let the packet continue down the arc, which
+   * is what the now-disabled feature means anyway. Every caller already reads
+   * QOS_ACTION_TRANSMIT as pass-through.
+   */
+  if (PREDICT_FALSE (policer_index == ~0))
+    return QOS_ACTION_TRANSMIT;
+
   /* Speculative prefetch assuming a conform result */
   vlib_prefetch_combined_counter (&policer_counters[POLICE_CONFORM],
 				  vm->thread_index, policer_index);
