@@ -492,6 +492,20 @@ vnet_send_dns_request (vlib_main_t * vm, dns_main_t * dm,
   if (ep->flags & DNS_CACHE_ENTRY_FLAG_VALID || ep->server_fails > 1)
     return;
 
+  /*
+   * Every path below indexes a server vector. With none configured (never
+   * added, or the last one deleted while enabled) that is a NULL or
+   * zero-length vector and the "address" handed to ip4_sas is garbage or
+   * NULL. Leave the entry pending; the resolver process retries it.
+   */
+  if (vec_len (dm->ip4_name_servers) == 0 &&
+      vec_len (dm->ip6_name_servers) == 0)
+    {
+      clib_warning ("dns: no name servers configured -- '%s' cannot be "
+		    "resolved", ep->name);
+      return;
+    }
+
   /* Construct the dns request, if we haven't been here already */
   if (vec_len (ep->dns_request) == 0)
     {
@@ -537,6 +551,20 @@ vnet_send_dns_request (vlib_main_t * vm, dns_main_t * dm,
     }
 
   /* Work out which server / address family we're going to use */
+
+  /*
+   * Point the entry at a family that actually has servers, and at a server
+   * that still exists. New entries start at af 0 / rotor 0, which with an
+   * ip6-only list indexed the empty ip4 vector; and a server deleted while
+   * a query is pending can leave the rotor past the end of the vector.
+   */
+  if (ep->server_af == 1 && vec_len (dm->ip6_name_servers) == 0)
+    ep->server_af = 0;
+  else if (ep->server_af == 0 && vec_len (dm->ip4_name_servers) == 0)
+    ep->server_af = 1;
+  if (ep->server_rotor >= (ep->server_af ? vec_len (dm->ip6_name_servers) :
+					     vec_len (dm->ip4_name_servers)))
+    ep->server_rotor = 0;
 
   /* Retry using current server */
   if (ep->retry_count++ < DNS_RETRIES_PER_SERVER)
@@ -768,6 +796,15 @@ vnet_dns_resolve_name (vlib_main_t * vm, dns_main_t * dm, u8 * name,
 
   /* In case we can't actually answer the question right now... */
   *retp = 0;
+
+  /*
+   * Not enabled means no upstream servers and no cache hash. Carrying on
+   * used to reach vnet_send_dns_request with a NULL server vector and
+   * SIGSEGV in ip4_sas -- one dns_resolve_name API call (the UI's "test
+   * lookup") was enough to take the whole data plane down.
+   */
+  if (dm->is_enabled == 0)
+    return VNET_API_ERROR_NAME_RESOLUTION_NOT_ENABLED;
 
   /* binary API caller might forget to set the name. Guess how we know. */
   if (name[0] == 0)
