@@ -818,6 +818,17 @@ vnet_dns_resolve_name (vlib_main_t * vm, dns_main_t * dm, u8 * name,
    */
   dns_normalize_name (name);
 
+  /*
+   * The blocklist is consulted before the cache and never enters it: a
+   * blocked name is answered from the blocklist's sentinel entry, which
+   * carries DNS_CACHE_ENTRY_FLAG_STATIC so the reply path (incl. the
+   * per-segment redirect) and the query log treat it as a block. Checking
+   * first also means a block takes effect at once, even for a name whose
+   * real answer is still cached.
+   */
+  if ((*retp = dns_blocklist_match (name)))
+    return 0;
+
   dns_cache_lock (dm, 5);
 search_again:
   p = hash_get_mem (dm->cache_entry_by_name, name);
@@ -1847,6 +1858,13 @@ dns_normalize_name (u8 * name)
 u8 *
 dns_build_static_reply (u8 * name, ip4_address_t * a4, ip6_address_t * a6)
 {
+  return dns_build_static_reply_ttl (name, a4, a6, 86400);
+}
+
+u8 *
+dns_build_static_reply_ttl (u8 *name, ip4_address_t *a4, ip6_address_t *a6,
+			    u32 ttl)
+{
   int a4_set = (a4 != 0);
   int a6_set = (a6 != 0);
   u8 *ce;
@@ -1895,7 +1913,7 @@ dns_build_static_reply (u8 * name, ip4_address_t * a4, ip6_address_t * a6)
       rr = (void *) rru8;
       rr->type = clib_host_to_net_u16 (DNS_TYPE_A);
       rr->class = clib_host_to_net_u16 (DNS_CLASS_IN);
-      rr->ttl = clib_host_to_net_u32 (86400);
+      rr->ttl = clib_host_to_net_u32 (ttl);
       rr->rdlength = clib_host_to_net_u16 (4);
       memcpy (rr->rdata, a4, sizeof (*a4));
     }
@@ -1908,7 +1926,7 @@ dns_build_static_reply (u8 * name, ip4_address_t * a4, ip6_address_t * a6)
       rr = (void *) rru8;
       rr->type = clib_host_to_net_u16 (DNS_TYPE_AAAA);
       rr->class = clib_host_to_net_u16 (DNS_CLASS_IN);
-      rr->ttl = clib_host_to_net_u32 (86400);
+      rr->ttl = clib_host_to_net_u32 (ttl);
       rr->rdlength = clib_host_to_net_u16 (16);
       memcpy (rr->rdata, a6, sizeof (*a6));
     }
@@ -3432,6 +3450,83 @@ done:
   REPLY_MACRO (VL_API_DNS_BLOCK_REDIRECT_ADD_DEL_REPLY);
 }
 
+static void
+vl_api_dns_blocklist_set_answer_t_handler (
+  vl_api_dns_blocklist_set_answer_t *mp)
+{
+  dns_main_t *dm = &dns_main;
+  vl_api_dns_blocklist_set_answer_reply_t *rmp;
+  ip4_address_t a4;
+  ip6_address_t a6;
+  int rv;
+
+  clib_memcpy (&a4, mp->ip4_address, sizeof (a4));
+  clib_memcpy (&a6, mp->ip6_address, sizeof (a6));
+  rv = dns_blocklist_set_answer (mp->ip4_set ? &a4 : 0, mp->ip6_set ? &a6 : 0);
+
+  REPLY_MACRO (VL_API_DNS_BLOCKLIST_SET_ANSWER_REPLY);
+}
+
+/* Registered thread-safe (dns_init): building a table of millions of
+   names takes a while, and must not hold the worker barrier while it
+   does. Only the final pointer swap takes the barrier. */
+static void
+vl_api_dns_blocklist_load_t_handler (vl_api_dns_blocklist_load_t *mp)
+{
+  dns_main_t *dm = &dns_main;
+  vl_api_dns_blocklist_load_reply_t *rmp;
+  u32 entries = 0, skipped = 0, live, limit;
+  u64 hits;
+  int rv;
+
+  mp->path[ARRAY_LEN (mp->path) - 1] = 0;
+  rv = dns_blocklist_load_file ((char *) mp->path, &entries, &skipped);
+  dns_blocklist_status (&live, &limit, &hits);
+
+  REPLY_MACRO2 (VL_API_DNS_BLOCKLIST_LOAD_REPLY, ({
+		  rmp->entries = clib_host_to_net_u32 (entries);
+		  rmp->skipped = clib_host_to_net_u32 (skipped);
+		  rmp->limit = clib_host_to_net_u32 (limit);
+		}));
+}
+
+static void
+vl_api_dns_blocklist_add_del_t_handler (vl_api_dns_blocklist_add_del_t *mp)
+{
+  dns_main_t *dm = &dns_main;
+  vl_api_dns_blocklist_add_del_reply_t *rmp;
+  u32 entries, limit;
+  u64 hits;
+  int rv;
+
+  mp->name[ARRAY_LEN (mp->name) - 1] = 0;
+  rv = dns_blocklist_add_del (mp->name, mp->is_add, mp->subdomains);
+  dns_blocklist_status (&entries, &limit, &hits);
+
+  REPLY_MACRO2 (VL_API_DNS_BLOCKLIST_ADD_DEL_REPLY, ({
+		  rmp->entries = clib_host_to_net_u32 (entries);
+		  rmp->limit = clib_host_to_net_u32 (limit);
+		}));
+}
+
+static void
+vl_api_dns_blocklist_status_t_handler (vl_api_dns_blocklist_status_t *mp)
+{
+  dns_main_t *dm = &dns_main;
+  vl_api_dns_blocklist_status_reply_t *rmp;
+  u32 entries, limit;
+  u64 hits;
+  int rv = 0;
+
+  dns_blocklist_status (&entries, &limit, &hits);
+
+  REPLY_MACRO2 (VL_API_DNS_BLOCKLIST_STATUS_REPLY, ({
+		  rmp->entries = clib_host_to_net_u32 (entries);
+		  rmp->limit = clib_host_to_net_u32 (limit);
+		  rmp->hits = clib_host_to_net_u64 (hits);
+		}));
+}
+
 #include <dns/dns.api.c>
 static clib_error_t *
 dns_init (vlib_main_t * vm)
@@ -3452,6 +3547,8 @@ dns_init (vlib_main_t * vm)
 
   /* Ask for a correctly-sized block of API message decode slots */
   dm->msg_id_base = setup_message_id_table ();
+  vl_api_set_msg_thread_safe (dm->api_main,
+			      dm->msg_id_base + VL_API_DNS_BLOCKLIST_LOAD, 1);
 
   return 0;
 }

@@ -206,6 +206,9 @@ app_certkey_alloc_int_ctx (app_cert_key_pair_t *ck,
 app_crypto_async_req_ticket_t
 app_crypto_async_req (app_crypto_async_req_t *req);
 void app_crypto_async_cancel_req (app_crypto_async_req_ticket_t ticket);
+/** Deliver an app's answer to an async crypto request. Must run on the
+    thread the request was made on (reply->handle.thread_index). */
+void app_crypto_async_reply (app_crypto_async_reply_t *reply);
 
 /*
  * Crypto engine management

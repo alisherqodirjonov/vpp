@@ -17,6 +17,7 @@
 #include <vnet/session/application_interface.h>
 #include <vnet/session/application.h>
 
+#include <http/http_certmint.h>
 #include <http/http.h>
 #include <http/http_private.h>
 #include <http/http_timer.h>
@@ -767,6 +768,9 @@ static session_cb_vft_t http_app_cb_vft = {
   .del_segment_callback = http_del_segment_callback,
   .builtin_app_rx_callback = http_ts_rx_callback,
   .builtin_app_tx_callback = http_ts_builtin_tx_callback,
+  /* TLS listeners without a certificate ask for one per SNI name; the
+     minter answers when a CA is configured (http_certmint.c). */
+  .app_crypto_async = http_certmint_async_req,
 };
 
 /*********************************/

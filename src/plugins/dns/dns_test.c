@@ -397,6 +397,61 @@ api_dns_block_redirect_add_del (vat_main_t * vam)
   return ret;
 }
 
+/*
+ * The blocklist messages are driven by the control plane and the
+ * "dns blocklist" CLI; VAT only needs the symbols to exist.
+ */
+static void
+vl_api_dns_blocklist_load_reply_t_handler (
+  vl_api_dns_blocklist_load_reply_t *mp)
+{
+  vat_main_t *vam = &vat_main;
+  vam->retval = ntohl (mp->retval);
+  vam->result_ready = 1;
+}
+
+static void
+vl_api_dns_blocklist_add_del_reply_t_handler (
+  vl_api_dns_blocklist_add_del_reply_t *mp)
+{
+  vat_main_t *vam = &vat_main;
+  vam->retval = ntohl (mp->retval);
+  vam->result_ready = 1;
+}
+
+static void
+vl_api_dns_blocklist_status_reply_t_handler (
+  vl_api_dns_blocklist_status_reply_t *mp)
+{
+  vat_main_t *vam = &vat_main;
+  vam->retval = ntohl (mp->retval);
+  vam->result_ready = 1;
+}
+
+static int
+api_dns_blocklist_set_answer (vat_main_t *vam)
+{
+  return -1;
+}
+
+static int
+api_dns_blocklist_load (vat_main_t *vam)
+{
+  return -1;
+}
+
+static int
+api_dns_blocklist_add_del (vat_main_t *vam)
+{
+  return -1;
+}
+
+static int
+api_dns_blocklist_status (vat_main_t *vam)
+{
+  return -1;
+}
+
 #include <dns/dns.api_test.c>
 
 /*

@@ -332,6 +332,13 @@ api_http_static_listener_add_del (vat_main_t *vam)
   return ret;
 }
 
+/* Configured by the control plane; VAT only needs the symbol. */
+static int
+api_http_static_set_mint_ca (vat_main_t *vam)
+{
+  return -1;
+}
+
 #include <http_static/http_static.api_test.c>
 
 /*

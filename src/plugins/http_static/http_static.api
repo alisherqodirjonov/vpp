@@ -3,7 +3,7 @@
     This file defines static http server control-plane API messages
 */
 
-option version = "2.6.0";
+option version = "2.7.0";
 
 /** \brief Configure and enable the static http server
     @param client_index - opaque cookie to identify the sender
@@ -125,4 +125,26 @@ autoreply define http_static_listener_add_del {
 
     string www_root[256];
     string uri[256];
+};
+
+/** \brief Set the CA that signs per-name server certificates
+
+    TLS listeners added with ckpair_index 0 carry no certificate of their
+    own: for every handshake one is minted for the name the client asked
+    for (SNI), signed by this CA, and cached. With no CA set, such
+    handshakes fail. Sending both lengths zero switches minting off.
+
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param cert_len - length of the CA certificate PEM at the start of pem
+    @param key_len - length of the CA private key PEM that follows it
+    @param pem - certificate PEM immediately followed by key PEM
+*/
+autoreply define http_static_set_mint_ca {
+  u32 client_index;
+  u32 context;
+  u32 cert_len;
+  u32 key_len;
+  u32 pem_len;
+  u8 pem[pem_len];
 };

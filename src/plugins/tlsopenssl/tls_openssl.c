@@ -87,6 +87,15 @@ openssl_ctx_free (tls_ctx_t * ctx)
       vec_free (ctx->srv_hostname);
     }
 
+  /* The app may still answer an async certificate request for this ctx.
+     Cancelled, the answer is dropped in app_crypto_async_reply (); left
+     live, it would resume the handshake of a freed (or reused) ctx. */
+  if (oc->async_cert_pending)
+    {
+      app_crypto_async_cancel_req (oc->req_ticket);
+      oc->async_cert_pending = 0;
+    }
+
   pool_put_index (openssl_main.ctx_pool[ctx->c_thread_index],
 		  oc->openssl_ctx_index);
 }
@@ -1305,6 +1314,7 @@ openssl_server_async_cert_cb (app_crypto_async_reply_t *reply)
   ctx = openssl_ctx_get_w_thread (handle.opaque & TLS_IDX_MASK,
 				  handle.thread_index);
   oc = (openssl_ctx_t *) ctx;
+  oc->async_cert_pending = 0;
 
   ckpair = app_cert_key_pair_get_if_valid (reply->async_cert.ckpair_index);
   if (!ckpair || !ckpair->cert || !ckpair->key)
@@ -1380,6 +1390,18 @@ openssl_server_cert_callback (SSL *ssl, void *arg)
   TLS_DBG (2, "Server certificate callback invoked for ctx %u",
 	   oc->openssl_ctx_index);
 
+  /*
+   * OpenSSL calls this again every time the handshake is re-entered: once
+   * the async reply resumes it (certificate now set -- carry on), and on
+   * any client data that arrives while the request is outstanding (keep
+   * waiting). Without these two checks the first case asked the app for a
+   * certificate forever and the second piled up duplicate requests.
+   */
+  if (SSL_get_certificate (ssl))
+    return 1;
+  if (oc->async_cert_pending)
+    return -1;
+
   /* Get the requested server name from SNI extension */
   servername = SSL_get_servername (ssl, TLSEXT_NAMETYPE_host_name);
   if (!servername)
@@ -1405,6 +1427,7 @@ openssl_server_cert_callback (SSL *ssl, void *arg)
   oc->req_ticket = app_crypto_async_req (&req);
   if (oc->req_ticket.as_u64 == APP_CRYPTO_ASYNC_INVALID_TICKET.as_u64)
     return 0;
+  oc->async_cert_pending = 1;
 
   /* Certificate selection in progress */
   return -1;

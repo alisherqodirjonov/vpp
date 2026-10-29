@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-option version = "1.2.0";
+option version = "1.3.0";
 
 /** \brief enable/disable name resolution
 
@@ -169,4 +169,81 @@ define dns_resolve_ip_reply {
     u32 context;
     i32 retval;
     u8 name[256];
+};
+
+/** \brief set the address every blocklisted name resolves to
+
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param ip4_set - ip4_address is valid
+    @param ip6_set - ip6_address is valid
+    @param ip4_address - A record answer (the block page address)
+    @param ip6_address - AAAA record answer
+*/
+autoreply define dns_blocklist_set_answer {
+    u32 client_index;
+    u32 context;
+    u8 ip4_set;
+    u8 ip6_set;
+    u8 ip4_address[4];
+    u8 ip6_address[16];
+};
+
+/** \brief replace the whole blocklist from a file
+
+    One entry per line, "S <name>" (name and all subdomains) or
+    "E <name>" (exact name only); '#' lines are ignored. The new table is
+    built off to the side and swapped in atomically; on any error the
+    current blocklist stays in force. Exceeding the configured
+    max-entries fails the whole load (LIMIT_EXCEEDED).
+
+    @param path - file readable by vpp
+*/
+define dns_blocklist_load {
+    u32 client_index;
+    u32 context;
+    u8 path[256];
+};
+
+define dns_blocklist_load_reply {
+    u32 context;
+    i32 retval;
+    u32 entries;
+    u32 skipped;
+    u32 limit;
+};
+
+/** \brief add or delete one blocklist entry in the live table
+
+    @param is_add - 1 add, 0 delete
+    @param subdomains - also block every name under it (add only)
+    @param name - the name
+*/
+define dns_blocklist_add_del {
+    u32 client_index;
+    u32 context;
+    u8 is_add;
+    u8 subdomains;
+    u8 name[256];
+};
+
+define dns_blocklist_add_del_reply {
+    u32 context;
+    i32 retval;
+    u32 entries;
+    u32 limit;
+};
+
+/** \brief blocklist size, capacity and hit count */
+define dns_blocklist_status {
+    u32 client_index;
+    u32 context;
+};
+
+define dns_blocklist_status_reply {
+    u32 context;
+    i32 retval;
+    u32 entries;
+    u32 limit;
+    u64 hits;
 };

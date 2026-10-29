@@ -16,6 +16,7 @@
 #include <vnet/vnet.h>
 #include <vnet/plugin/plugin.h>
 #include <http_static/http_static.h>
+#include <http/http_certmint.h>
 
 #include <vlibapi/api.h>
 #include <vlibmemory/api.h>
@@ -239,6 +240,37 @@ vl_api_http_static_listener_add_del_t_handler (
 
 done:
   REPLY_MACRO (VL_API_HTTP_STATIC_LISTENER_ADD_DEL_REPLY);
+}
+
+/* The minter lives in the http plugin (it answers the HTTP transport's
+   TLS certificate requests); reach it by symbol, as plugins do. */
+static void
+vl_api_http_static_set_mint_ca_t_handler (vl_api_http_static_set_mint_ca_t *mp)
+{
+  vl_api_http_static_set_mint_ca_reply_t *rmp;
+  hss_main_t *hsm = &hss_main;
+  static http_certmint_set_ca_fn *set_ca;
+  u32 cert_len = ntohl (mp->cert_len);
+  u32 key_len = ntohl (mp->key_len);
+  u32 pem_len = ntohl (mp->pem_len);
+  int rv;
+
+  if ((u64) cert_len + key_len != pem_len)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+  if (!set_ca)
+    set_ca = vlib_get_plugin_symbol ("http_plugin.so", "http_certmint_set_ca");
+  if (!set_ca)
+    {
+      rv = VNET_API_ERROR_UNIMPLEMENTED;
+      goto done;
+    }
+  rv = set_ca (mp->pem, cert_len, mp->pem + cert_len, key_len);
+
+done:
+  REPLY_MACRO (VL_API_HTTP_STATIC_SET_MINT_CA_REPLY);
 }
 
 #include <http_static/http_static.api.c>

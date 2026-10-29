@@ -264,6 +264,8 @@ int vnet_dns_response_to_reply (u8 * response, dns_resolve_name_t * rn,
 
 u8 *dns_build_static_reply (u8 * name, ip4_address_t * a4,
 			    ip6_address_t * a6);
+u8 *dns_build_static_reply_ttl (u8 *name, ip4_address_t *a4,
+				ip6_address_t *a6, u32 ttl);
 
 format_function_t format_dns_reply;
 
@@ -293,6 +295,44 @@ dns_cache_unlock (dns_main_t * dm)
 extern int dns_resolve_name (u8 *name, dns_cache_entry_t **ep,
 			     dns_pending_request_t *t0,
 			     dns_resolve_name_t *rn);
+
+/* ----------------------------------------------------------- blocklist
+ * Large-scale name blocklist, separate from the resolver cache. See
+ * dns_blocklist.c for the design. */
+
+#include <vppinfra/bihash_8_8.h>
+#include <vppinfra/bihash_template.h>
+
+#define DNS_BLOCKLIST_F_BLOCK	   (1 << 0) /**< this exact name */
+#define DNS_BLOCKLIST_F_SUBDOMAINS (1 << 1) /**< and every name under it */
+
+typedef struct
+{
+  clib_bihash_8_8_t hash;
+  clib_mem_heap_t *heap; /**< private heap holding everything in hash */
+  u32 count;
+} dns_blocklist_table_t;
+
+typedef struct
+{
+  /** live table, swapped under the worker barrier; 0 = nothing blocked */
+  dns_blocklist_table_t *table;
+  /** answer for every blocked name; not a member of the cache pool */
+  dns_cache_entry_t sentinel;
+  u32 max_entries;
+  u64 hits;
+  u32 entries_idx, limit_idx;
+} dns_blocklist_main_t;
+
+extern dns_blocklist_main_t dns_blocklist_main;
+
+dns_cache_entry_t *dns_blocklist_match (u8 *name);
+int dns_blocklist_load_file (const char *path, u32 *n_entries,
+			     u32 *n_skipped);
+int dns_blocklist_add_del (u8 *name, int is_add, int subdomains);
+int dns_blocklist_set_answer (ip4_address_t *a4, ip6_address_t *a6);
+void dns_blocklist_clear (void);
+void dns_blocklist_status (u32 *entries, u32 *limit, u64 *hits);
 #endif /* included_dns_h */
 
 /*

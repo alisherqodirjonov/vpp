@@ -16,6 +16,7 @@ add_vpp_plugin(dns
   SOURCES
   dns.c
   dns.h
+  dns_blocklist.c
   request_node.c
   reply_node.c
   resolver_process.c

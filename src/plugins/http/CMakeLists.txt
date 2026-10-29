@@ -11,8 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if(OPENSSL_FOUND)
+  include_directories(${OPENSSL_INCLUDE_DIR})
+endif()
+
 add_vpp_plugin(http
   SOURCES
+  http_certmint.c
   http2/hpack.c
   http2/http2.c
   http2/frame.c
@@ -22,6 +27,9 @@ add_vpp_plugin(http
   http_buffer.c
   http_timer.c
   http1.c
+
+  LINK_LIBRARIES
+  ${OPENSSL_LIBRARIES}
 )
 
 add_vpp_plugin(http_unittest

@@ -59,6 +59,9 @@ typedef struct tls_ctx_openssl_
   BIO *rbio;
   BIO *wbio;
   app_crypto_async_req_ticket_t req_ticket;
+  /** an async certificate request is outstanding (req_ticket is live);
+      a zeroed ticket is a valid-looking one, so it cannot tell us */
+  u8 async_cert_pending;
 } openssl_ctx_t;
 
 typedef struct tls_listen_ctx_opensl_
