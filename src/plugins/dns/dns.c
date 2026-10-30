@@ -3543,6 +3543,8 @@ dns_init (vlib_main_t * vm)
   dm->cache_limit_idx = vlib_stats_add_gauge ("/dns/cache/limit");
   dm->cache_hits_idx = vlib_stats_add_gauge ("/dns/cache/hits");
   dm->cache_misses_idx = vlib_stats_add_gauge ("/dns/cache/misses");
+  dm->queries_total_idx = vlib_stats_add_gauge ("/dns/queries/total");
+  dm->queries_blocked_idx = vlib_stats_add_gauge ("/dns/queries/blocked");
   vlib_stats_set_gauge (dm->cache_limit_idx, dm->name_cache_size);
 
   /* Ask for a correctly-sized block of API message decode slots */

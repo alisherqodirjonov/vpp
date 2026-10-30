@@ -17,6 +17,7 @@
 
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
+#include <vlib/stats/stats.h>
 
 vlib_node_registration_t dns46_request_node;
 
@@ -248,6 +249,14 @@ dns46_request_inline (vlib_main_t * vm,
 	  c_name0 = vec_dup (name0);
 	  vec_add1 (c_name0, 0);
 	  vnet_dns_resolve_name (vm, dm, c_name0, t0, &ep0);
+
+	  vlib_stats_set_gauge (
+	    dm->queries_total_idx,
+	    clib_atomic_add_fetch (&dm->queries_total, 1));
+	  if (ep0 == &dns_blocklist_main.sentinel)
+	    vlib_stats_set_gauge (
+	      dm->queries_blocked_idx,
+	      clib_atomic_add_fetch (&dm->queries_blocked, 1));
 
 	  /* Log only what we actually answered here. A pending resolution is
 	     logged by the resolver process once the upstream reply lands, so

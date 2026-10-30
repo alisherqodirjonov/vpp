@@ -168,6 +168,12 @@ typedef struct
   u32 cache_entries_idx, cache_limit_idx, cache_hits_idx, cache_misses_idx;
   u64 cache_hits, cache_misses;
 
+  /* Client queries handled by the request node (not API lookups), and
+     how many of them were answered from the blocklist. Cumulative since
+     start, under /dns/queries/; the control plane turns them into rates. */
+  u32 queries_total_idx, queries_blocked_idx;
+  u64 queries_total, queries_blocked;
+
   /** message-ID base */
   u16 msg_id_base;
 
